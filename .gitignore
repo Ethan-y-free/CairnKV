@@ -1,0 +1,13 @@
+build/
+cmake-build-*/
+.vs/
+.vscode/
+*.o
+*.a
+*.so
+*.exe
+*.pdb
+*.log
+data/
+out/
+CMakeSettings.json
