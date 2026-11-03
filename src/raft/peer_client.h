@@ -33,6 +33,9 @@ public:
     void Stop();
     void Send(const RaftMessage& message);
 
+    // Test/ops hook: drop outgoing traffic to this peer.
+    void SetBlocked(bool blocked);
+
 private:
     void Run();
     bool Connect();
@@ -49,6 +52,7 @@ private:
     std::condition_variable cv_;
     std::deque<RaftMessage> queue_;
     bool running_ = false;
+    bool blocked_ = false;
     int fd_ = -1;
     uint64_t next_request_id_ = 1;
 };

@@ -1,7 +1,9 @@
 build/
+out/
 cmake-build-*/
 .vs/
 .vscode/
+CMakeSettings.json
 *.o
 *.a
 *.so
@@ -9,5 +11,3 @@ cmake-build-*/
 *.pdb
 *.log
 data/
-out/
-CMakeSettings.json

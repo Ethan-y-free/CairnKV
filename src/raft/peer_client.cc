@@ -113,7 +113,7 @@ void PeerClient::Send(const RaftMessage& message)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!running_)
+        if (!running_ || blocked_)
         {
             return;
         }
@@ -124,6 +124,22 @@ void PeerClient::Send(const RaftMessage& message)
         queue_.push_back(message);
     }
     cv_.notify_one();
+}
+
+void PeerClient::SetBlocked(bool blocked)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        blocked_ = blocked;
+        if (blocked)
+        {
+            queue_.clear();
+        }
+    }
+    if (!blocked)
+    {
+        cv_.notify_one();
+    }
 }
 
 bool PeerClient::Connect()
@@ -259,6 +275,14 @@ void PeerClient::Run()
             queue_.pop_front();
         }
 
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (blocked_)
+            {
+                continue;
+            }
+        }
+
         if (fd_ < 0 && !Connect())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -287,6 +311,14 @@ void PeerClient::Run()
         {
             Close();
             continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (blocked_)
+            {
+                continue;
+            }
         }
         if (callback_)
         {

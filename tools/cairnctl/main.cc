@@ -16,7 +16,9 @@ struct Options
     std::string key;
     std::string value;
     std::string prefix;
+    std::vector<std::string> blocked_peers;
     uint32_t limit = 100;
+    bool stale = false;
 };
 
 bool ParseAddress(const std::string& address, std::string* host, uint16_t* port)
@@ -42,13 +44,15 @@ bool ParseAddress(const std::string& address, std::string* host, uint16_t* port)
 void PrintUsage()
 {
     std::cout
-        << "usage: cairnctl [--addr host:port] <command> [args]\n"
+        << "usage: cairnctl [--addr host:port] [--stale] <command> [args]\n"
         << "commands:\n"
         << "  put <key> <value>\n"
-        << "  get <key>\n"
+        << "  get <key>              (--stale: local read, may be old)\n"
         << "  delete <key>\n"
         << "  scan <prefix> [limit]\n"
-        << "  status\n";
+        << "  status\n"
+        << "  partition <id1,id2>    (test hook: drop Raft traffic)\n"
+        << "  unpartition";
 }
 
 }
@@ -58,15 +62,27 @@ int main(int argc, char** argv)
     Options options;
 
     int index = 1;
-    if (index < argc && std::string(argv[index]) == "--addr")
+    while (index < argc)
     {
-        if (index + 1 >= argc ||
-            !ParseAddress(argv[index + 1], &options.host, &options.port))
+        const std::string arg = argv[index];
+        if (arg == "--addr")
         {
-            std::cerr << "invalid --addr\n";
-            return 1;
+            if (index + 1 >= argc ||
+                !ParseAddress(argv[index + 1], &options.host, &options.port))
+            {
+                std::cerr << "invalid --addr\n";
+                return 1;
+            }
+            index += 2;
+            continue;
         }
-        index += 2;
+        if (arg == "--stale")
+        {
+            options.stale = true;
+            ++index;
+            continue;
+        }
+        break;
     }
 
     if (index >= argc)
@@ -108,6 +124,42 @@ int main(int argc, char** argv)
             options.limit = static_cast<uint32_t>(std::strtoul(argv[index++], nullptr, 10));
         }
     }
+    else if (options.command == "partition")
+    {
+        if (index >= argc)
+        {
+            PrintUsage();
+            return 1;
+        }
+        const std::string text = argv[index++];
+        size_t start = 0;
+        while (start < text.size())
+        {
+            const size_t comma = text.find(',', start);
+            const std::string peer_id =
+                text.substr(start, comma == std::string::npos
+                                       ? std::string::npos
+                                       : comma - start);
+            if (!peer_id.empty())
+            {
+                options.blocked_peers.push_back(peer_id);
+            }
+            if (comma == std::string::npos)
+            {
+                break;
+            }
+            start = comma + 1;
+        }
+        if (options.blocked_peers.empty())
+        {
+            PrintUsage();
+            return 1;
+        }
+    }
+    else if (options.command == "unpartition")
+    {
+        // Empty blocked_peers clears the partition.
+    }
     else if (options.command != "status")
     {
         PrintUsage();
@@ -126,6 +178,19 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    if (options.command == "partition" || options.command == "unpartition")
+    {
+        const cairnkv::Status status =
+            (*client)->SetBlockedPeers(options.blocked_peers);
+        if (!status.ok())
+        {
+            std::cerr << status.ToString() << "\n";
+            return 1;
+        }
+        std::cout << "OK\n";
+        return 0;
+    }
+
     if (options.command == "put")
     {
         const cairnkv::Status status = (*client)->Put(options.key, options.value);
@@ -140,8 +205,11 @@ int main(int argc, char** argv)
 
     if (options.command == "get")
     {
+        cairnkv::ReadOptions read_options;
+        read_options.mode = options.stale ? cairnkv::ReadMode::kStale
+                                          : cairnkv::ReadMode::kLinearizable;
         cairnkv::StatusOr<cairnkv::GetResult> result =
-            (*client)->Get(options.key, cairnkv::ReadOptions{});
+            (*client)->Get(options.key, read_options);
         if (!result.ok())
         {
             std::cerr << result.status().ToString() << "\n";

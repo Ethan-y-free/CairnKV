@@ -59,11 +59,31 @@ public:
                                           uint32_t limit);
     StatusOr<ClusterStatus> GetStatus();
 
+    // Test/ops hook: drop all traffic to and from the given peers. This is
+    // used by scripts/partition-smoke.sh to simulate a network partition.
+    void SetBlockedPeers(const std::set<std::string>& peers);
+    bool IsPeerBlocked(const std::string& peer_id) const;
+
     // Called by RpcServer's I/O thread. Dispatches in the Raft core and waits
     // for the response, so peers always observe a serialized state machine.
     RaftMessage HandleRaftRequest(const RaftMessage& request);
 
 private:
+    struct ReadRound
+    {
+        uint64_t read_index = 0;
+        std::string key;
+        std::shared_ptr<std::promise<StatusOr<GetResult>>> promise;
+        std::set<std::string> acks;
+        bool majority_acked = false;
+    };
+
+    struct PendingRead
+    {
+        std::string key;
+        std::shared_ptr<std::promise<StatusOr<GetResult>>> promise;
+    };
+
     using Clock = std::chrono::steady_clock;
 
     void Enqueue(std::function<void()> task);
@@ -88,6 +108,15 @@ private:
     void AdvanceCommitIndex();
     void ApplyCommitted();
     void FailPendingWrites(const Status& status);
+
+    void StartReadIndex(
+        const std::string& key,
+        const std::shared_ptr<std::promise<StatusOr<GetResult>>>& promise);
+    void SendReadIndexHeartbeat(const std::string& peer_id, uint64_t context);
+    void MaybeBecomeReadReady();
+    void FlushPendingReads();
+    void CompleteReadRounds();
+    void FailReadRequests(const Status& status);
 
     std::string LeaderAddressUnlocked() const;
     Status NotLeaderStatusUnlocked() const;
@@ -117,6 +146,15 @@ private:
     std::map<uint64_t, std::shared_ptr<std::promise<StatusOr<uint64_t>>>>
         pending_writes_;
     std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
+
+    bool leader_ready_ = false;
+    uint64_t leader_noop_index_ = 0;
+    uint64_t next_read_context_ = 1;
+    std::map<uint64_t, ReadRound> read_rounds_;
+    std::deque<PendingRead> pending_reads_before_ready_;
+
+    mutable std::mutex blocked_mutex_;
+    std::set<std::string> blocked_peers_;
 
     std::atomic<uint64_t> term_snapshot_{0};
     std::atomic<bool> running_{false};

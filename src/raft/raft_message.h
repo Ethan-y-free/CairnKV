@@ -41,6 +41,9 @@ struct RaftMessage
     // AppendEntriesResp
     bool success = false;
     uint64_t match_index = 0;
+
+    // ReadIndex heartbeat correlation; 0 means a normal AppendEntries.
+    uint64_t read_context = 0;
 };
 
 std::string EncodeRaftMessage(const RaftMessage& message);

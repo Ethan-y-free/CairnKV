@@ -101,6 +101,7 @@ void RaftNode::Stop()
     }
 
     FailPendingWrites(Status(StatusCode::kUnavailable, "raft node stopped"));
+    FailReadRequests(Status(StatusCode::kUnavailable, "raft node stopped"));
 }
 
 void RaftNode::Enqueue(std::function<void()> task)
@@ -196,12 +197,15 @@ void RaftNode::StartElection()
     ++current_term_;
     voted_for_ = options_.node_id;
     leader_id_.clear();
+    leader_ready_ = false;
+    leader_noop_index_ = 0;
     term_snapshot_.store(current_term_);
 
     votes_received_.clear();
     votes_received_.insert(options_.node_id);
     ResetElectionDeadline();
     FailPendingWrites(NotLeaderStatusUnlocked());
+    FailReadRequests(NotLeaderStatusUnlocked());
 
     if (!PersistHardStateUnlocked().ok())
     {
@@ -252,17 +256,22 @@ void RaftNode::BecomeFollower(uint64_t term, const std::string& new_leader_id)
 
     role_ = NodeRole::kFollower;
     leader_id_ = new_leader_id;
+    leader_ready_ = false;
+    leader_noop_index_ = 0;
     votes_received_.clear();
     next_index_.clear();
     match_index_.clear();
     ResetElectionDeadline();
     FailPendingWrites(NotLeaderStatusUnlocked());
+    FailReadRequests(NotLeaderStatusUnlocked());
 }
 
 void RaftNode::BecomeLeader()
 {
     role_ = NodeRole::kLeader;
     leader_id_ = options_.node_id;
+    leader_ready_ = false;
+    leader_noop_index_ = 0;
     votes_received_.clear();
 
     next_index_.clear();
@@ -291,6 +300,9 @@ void RaftNode::BecomeLeader()
         return;
     }
 
+    leader_noop_index_ = noop.index;
+    leader_ready_ = false;
+
     ResetHeartbeatDeadline();
     CAIRNKV_LOG_INFO("node " << options_.node_id << " became leader for term "
                              << current_term_);
@@ -301,6 +313,8 @@ void RaftNode::BecomeLeader()
     {
         commit_index_ = log_.LastIndex();
         ApplyCommitted();
+        MaybeBecomeReadReady();
+        CompleteReadRounds();
     }
 }
 
@@ -409,6 +423,8 @@ void RaftNode::AdvanceCommitIndex()
         {
             commit_index_ = index;
             ApplyCommitted();
+            MaybeBecomeReadReady();
+            CompleteReadRounds();
             break;
         }
     }
@@ -442,6 +458,8 @@ void RaftNode::ApplyCommitted()
             pending_writes_.erase(pending);
         }
     }
+
+    CompleteReadRounds();
 }
 
 void RaftNode::FailPendingWrites(const Status& status)
@@ -452,6 +470,157 @@ void RaftNode::FailPendingWrites(const Status& status)
         promise->set_value(StatusOr<uint64_t>(status));
     }
     pending_writes_.clear();
+}
+
+void RaftNode::StartReadIndex(
+    const std::string& key,
+    const std::shared_ptr<std::promise<StatusOr<GetResult>>>& promise)
+{
+    if (role_ != NodeRole::kLeader)
+    {
+        promise->set_value(StatusOr<GetResult>(NotLeaderStatusUnlocked()));
+        return;
+    }
+    if (!leader_ready_)
+    {
+        pending_reads_before_ready_.push_back(PendingRead{key, promise});
+        return;
+    }
+
+    const uint64_t context = next_read_context_++;
+    ReadRound round;
+    round.read_index = commit_index_;
+    round.key = key;
+    round.promise = promise;
+    round.acks.insert(options_.node_id);
+
+    auto inserted = read_rounds_.emplace(context, std::move(round));
+    ReadRound& stored = inserted.first->second;
+
+    if (stored.acks.size() >= Majority())
+    {
+        stored.majority_acked = true;
+    }
+    else
+    {
+        for (const auto& [peer_id, client] : peer_clients_)
+        {
+            (void)client;
+            SendReadIndexHeartbeat(peer_id, context);
+        }
+    }
+    CompleteReadRounds();
+}
+
+void RaftNode::SendReadIndexHeartbeat(const std::string& peer_id,
+                                      uint64_t context)
+{
+    if (role_ != NodeRole::kLeader)
+    {
+        return;
+    }
+    auto client_it = peer_clients_.find(peer_id);
+    if (client_it == peer_clients_.end())
+    {
+        return;
+    }
+
+    RaftMessage message;
+    message.type = RaftMessageType::kAppendEntries;
+    message.term = current_term_;
+    message.from_id = options_.node_id;
+    message.to_id = peer_id;
+    message.leader_id = options_.node_id;
+    message.prev_log_index = log_.LastIndex();
+    message.prev_log_term = log_.LastTerm();
+    message.leader_commit = commit_index_;
+    message.read_context = context;
+    client_it->second->Send(message);
+}
+
+void RaftNode::MaybeBecomeReadReady()
+{
+    if (role_ != NodeRole::kLeader || leader_ready_ ||
+        leader_noop_index_ == 0 || commit_index_ < leader_noop_index_)
+    {
+        return;
+    }
+
+    StatusOr<LogEntry> entry = log_.Get(leader_noop_index_);
+    if (!entry.ok() || entry->term != current_term_)
+    {
+        return;
+    }
+
+    leader_ready_ = true;
+    FlushPendingReads();
+}
+
+void RaftNode::FlushPendingReads()
+{
+    std::deque<PendingRead> pending;
+    pending.swap(pending_reads_before_ready_);
+    for (auto& read : pending)
+    {
+        StartReadIndex(read.key, read.promise);
+    }
+}
+
+void RaftNode::CompleteReadRounds()
+{
+    for (auto it = read_rounds_.begin(); it != read_rounds_.end();)
+    {
+        if (!it->second.majority_acked ||
+            it->second.read_index > last_applied_)
+        {
+            ++it;
+            continue;
+        }
+
+        StatusOr<std::string> value = state_.Get(it->second.key);
+        if (!value.ok())
+        {
+            it->second.promise->set_value(StatusOr<GetResult>(value.status()));
+        }
+        else
+        {
+            it->second.promise->set_value(
+                StatusOr<GetResult>(GetResult{*value, last_applied_}));
+        }
+        it = read_rounds_.erase(it);
+    }
+}
+
+void RaftNode::FailReadRequests(const Status& status)
+{
+    for (auto& [context, round] : read_rounds_)
+    {
+        (void)context;
+        round.promise->set_value(StatusOr<GetResult>(status));
+    }
+    read_rounds_.clear();
+
+    for (auto& read : pending_reads_before_ready_)
+    {
+        read.promise->set_value(StatusOr<GetResult>(status));
+    }
+    pending_reads_before_ready_.clear();
+}
+
+void RaftNode::SetBlockedPeers(const std::set<std::string>& peers)
+{
+    std::lock_guard<std::mutex> lock(blocked_mutex_);
+    blocked_peers_ = peers;
+    for (const auto& [peer_id, client] : peer_clients_)
+    {
+        client->SetBlocked(peers.count(peer_id) != 0);
+    }
+}
+
+bool RaftNode::IsPeerBlocked(const std::string& peer_id) const
+{
+    std::lock_guard<std::mutex> lock(blocked_mutex_);
+    return blocked_peers_.count(peer_id) != 0;
 }
 
 std::string RaftNode::LeaderAddressUnlocked() const
@@ -556,6 +725,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
     response.to_id = request.from_id;
     response.success = false;
     response.match_index = log_.LastIndex();
+    response.read_context = request.read_context;
 
     if (request.term < current_term_)
     {
@@ -684,6 +854,20 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
     if (role_ != NodeRole::kLeader || response.term != current_term_)
     {
         return;
+    }
+
+    if (response.read_context != 0)
+    {
+        auto read_it = read_rounds_.find(response.read_context);
+        if (read_it != read_rounds_.end())
+        {
+            read_it->second.acks.insert(response.from_id);
+            if (read_it->second.acks.size() >= Majority())
+            {
+                read_it->second.majority_acked = true;
+            }
+            CompleteReadRounds();
+        }
     }
 
     auto next_it = next_index_.find(response.from_id);
@@ -882,8 +1066,6 @@ Status RaftNode::Delete(const std::string& key)
 
 StatusOr<GetResult> RaftNode::Get(const std::string& key, ReadOptions opts)
 {
-    (void)opts;   // W2 is leader-only; ReadIndex is added in W3.
-
     if (!running_.load())
     {
         return Status(StatusCode::kUnavailable, "raft node stopped");
@@ -891,19 +1073,26 @@ StatusOr<GetResult> RaftNode::Get(const std::string& key, ReadOptions opts)
 
     auto promise = std::make_shared<std::promise<StatusOr<GetResult>>>();
     auto future = promise->get_future();
-    Enqueue([this, key, promise] {
+    Enqueue([this, key, opts, promise] {
+        if (opts.mode == ReadMode::kStale)
+        {
+            StatusOr<std::string> value = state_.Get(key);
+            if (!value.ok())
+            {
+                promise->set_value(StatusOr<GetResult>(value.status()));
+                return;
+            }
+            promise->set_value(
+                StatusOr<GetResult>(GetResult{*value, last_applied_}));
+            return;
+        }
+
         if (role_ != NodeRole::kLeader)
         {
             promise->set_value(StatusOr<GetResult>(NotLeaderStatusUnlocked()));
             return;
         }
-        StatusOr<std::string> value = state_.Get(key);
-        if (!value.ok())
-        {
-            promise->set_value(StatusOr<GetResult>(value.status()));
-            return;
-        }
-        promise->set_value(StatusOr<GetResult>(GetResult{*value, last_applied_}));
+        StartReadIndex(key, promise);
     });
 
     const int timeout_ms =

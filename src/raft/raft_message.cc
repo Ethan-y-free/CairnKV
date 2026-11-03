@@ -60,6 +60,7 @@ std::string EncodeRaftMessage(const RaftMessage& message)
     encoding::AppendU64(&out, message.leader_commit);
     encoding::AppendU8(&out, message.success ? 1 : 0);
     encoding::AppendU64(&out, message.match_index);
+    encoding::AppendU64(&out, message.read_context);
     return out;
 }
 
@@ -175,7 +176,8 @@ StatusOr<RaftMessage> DecodeRaftMessage(std::string_view payload)
     uint8_t success = 0;
     if (!encoding::ReadU64(payload, &pos, &message.leader_commit) ||
         !encoding::ReadU8(payload, &pos, &success) ||
-        !encoding::ReadU64(payload, &pos, &message.match_index))
+        !encoding::ReadU64(payload, &pos, &message.match_index) ||
+        !encoding::ReadU64(payload, &pos, &message.read_context))
     {
         return Status(StatusCode::kCorruption, "truncated raft message tail");
     }

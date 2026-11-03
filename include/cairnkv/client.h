@@ -35,6 +35,10 @@ public:
                                           ScanOptions opts = {});
     StatusOr<ClusterStatus> GetStatus();
 
+    // Test/ops hook: drop all Raft traffic to/from the given peer ids.
+    // Empty list clears the partition.
+    Status SetBlockedPeers(const std::vector<std::string>& peer_ids);
+
     // Opaque implementation; public so out-of-line member definitions compile.
     struct Impl;
 

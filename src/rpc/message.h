@@ -17,7 +17,9 @@ enum class Op : uint8_t
     kGet = 2,
     kDelete = 3,
     kScan = 4,
-    kStatus = 5
+    kStatus = 5,
+    kPartition = 6,
+    kUnpartition = 7
 };
 
 struct ClientRequest
@@ -27,6 +29,7 @@ struct ClientRequest
     std::string key;
     std::string value;
     std::string prefix;
+    std::string blocked_peers;
     uint32_t limit = 100;
 };
 

@@ -416,4 +416,24 @@ StatusOr<ClusterStatus> Client::GetStatus()
     return response.cluster;
 }
 
+Status Client::SetBlockedPeers(const std::vector<std::string>& peer_ids)
+{
+    ClientRequest request;
+    request.op = peer_ids.empty() ? Op::kUnpartition : Op::kPartition;
+
+    std::string joined;
+    for (const auto& peer_id : peer_ids)
+    {
+        if (!joined.empty())
+        {
+            joined += ',';
+        }
+        joined += peer_id;
+    }
+    request.blocked_peers = std::move(joined);
+
+    ClientResponse response;
+    return impl_->Rpc(request, &response);
+}
+
 }

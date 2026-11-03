@@ -1,5 +1,6 @@
 #include "consensus/rpc_server.h"
 
+#include <set>
 #include <utility>
 
 #include "common/logging.h"
@@ -106,6 +107,36 @@ void RpcServer::HandleClientRequest(const ClientRequest& request,
             }
             break;
         }
+        case Op::kPartition:
+        {
+            std::set<std::string> peers;
+            size_t start = 0;
+            const std::string& text = request.blocked_peers;
+            while (start < text.size())
+            {
+                const size_t comma = text.find(',', start);
+                const std::string peer_id =
+                    text.substr(start, comma == std::string::npos
+                                           ? std::string::npos
+                                           : comma - start);
+                if (!peer_id.empty())
+                {
+                    peers.insert(peer_id);
+                }
+                if (comma == std::string::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+            node_->SetBlockedPeers(peers);
+            break;
+        }
+        case Op::kUnpartition:
+        {
+            node_->SetBlockedPeers({});
+            break;
+        }
     }
 }
 
@@ -175,6 +206,12 @@ void RpcServer::OnMessage(const std::shared_ptr<net::Connection>& connection,
                                  << connection->fd());
                 connection->Close();
                 return;
+            }
+
+            if (node_->IsPeerBlocked(message->from_id))
+            {
+                // Simulated partition: consume and drop without a response.
+                continue;
             }
 
             const RaftMessage response = node_->HandleRaftRequest(*message);

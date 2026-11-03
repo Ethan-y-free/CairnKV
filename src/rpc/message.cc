@@ -41,6 +41,7 @@ std::string EncodeClientRequest(const ClientRequest& request)
     encoding::AppendString(&out, request.key);
     encoding::AppendString(&out, request.value);
     encoding::AppendString(&out, request.prefix);
+    encoding::AppendString(&out, request.blocked_peers);
     encoding::AppendU32(&out, request.limit);
     return out;
 }
@@ -56,7 +57,7 @@ StatusOr<ClientRequest> DecodeClientRequest(std::string_view payload)
         return Status(StatusCode::kCorruption, "truncated client request");
     }
     if (op < static_cast<uint8_t>(Op::kPut) ||
-        op > static_cast<uint8_t>(Op::kStatus))
+        op > static_cast<uint8_t>(Op::kUnpartition))
     {
         return Status(StatusCode::kInvalidArgument, "invalid operation");
     }
@@ -89,6 +90,13 @@ StatusOr<ClientRequest> DecodeClientRequest(std::string_view payload)
         return prefix.status();
     }
     request.prefix = *prefix;
+
+    StatusOr<std::string> blocked_peers = ReadBoundedString(payload, &pos);
+    if (!blocked_peers.ok())
+    {
+        return blocked_peers.status();
+    }
+    request.blocked_peers = *blocked_peers;
 
     if (!encoding::ReadU32(payload, &pos, &request.limit))
     {

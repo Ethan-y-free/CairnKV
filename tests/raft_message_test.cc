@@ -37,6 +37,7 @@ TEST(RaftMessageTest, AppendEntriesRoundTrip)
     message.prev_log_index = 4;
     message.prev_log_term = 2;
     message.leader_commit = 4;
+    message.read_context = 42;
 
     LogEntry put;
     put.index = 5;
@@ -60,6 +61,7 @@ TEST(RaftMessageTest, AppendEntriesRoundTrip)
     EXPECT_EQ(decoded->prev_log_index, 4u);
     EXPECT_EQ(decoded->prev_log_term, 2u);
     EXPECT_EQ(decoded->leader_commit, 4u);
+    EXPECT_EQ(decoded->read_context, 42u);
     ASSERT_EQ(decoded->entries.size(), 2u);
     EXPECT_EQ(decoded->entries[0].key, "k");
     EXPECT_EQ(decoded->entries[0].value, "v");

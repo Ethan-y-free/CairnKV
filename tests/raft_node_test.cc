@@ -91,6 +91,29 @@ TEST(RaftNodeTest, SingleNodeElectsAndServes)
     std::filesystem::remove_all(dir);
 }
 
+TEST(RaftNodeTest, StaleReadReturnsLocalAppliedValue)
+{
+    const auto dir = MakeTempDir();
+    const std::string data_dir = (dir / "node-1").string();
+    const RaftNode::Options options = SingleNodeOptions(data_dir);
+
+    {
+        RaftNode node(options);
+        ASSERT_TRUE(node.Start().ok());
+        ASSERT_TRUE(WaitForLeader(&node));
+        ASSERT_TRUE(node.Put("k", "v").ok());
+
+        ReadOptions stale;
+        stale.mode = ReadMode::kStale;
+        StatusOr<GetResult> get = node.Get("k", stale);
+        ASSERT_TRUE(get.ok());
+        EXPECT_EQ(get->value, "v");
+
+        node.Stop();
+    }
+    std::filesystem::remove_all(dir);
+}
+
 TEST(RaftNodeTest, DeleteIsReplicatedThroughTheLog)
 {
     const auto dir = MakeTempDir();
