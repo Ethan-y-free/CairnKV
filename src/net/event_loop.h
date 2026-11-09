@@ -44,7 +44,10 @@ private:
     int epoll_fd_ = -1;
     int wakeup_fd_ = -1;
     std::atomic<bool> running_{true};
-    std::thread::id thread_id_;
+    // Captured in the constructor. EventLoopThreadPool constructs each loop
+    // inside the thread that runs it and waits on a promise before handing
+    // the pointer out, so concurrent readers are safe.
+    const std::thread::id thread_id_;
     std::mutex mutex_;
     std::vector<std::function<void()>> pending_;
     std::unordered_map<int, Channel*> channels_;

@@ -53,8 +53,6 @@ EventLoop::~EventLoop()
 
 void EventLoop::Run()
 {
-    thread_id_ = std::this_thread::get_id();
-
     std::vector<struct epoll_event> events(64);
     while (running_.load())
     {
