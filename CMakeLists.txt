@@ -10,6 +10,7 @@ option(CAIRNKV_BUILD_SERVER "Build cairnkd" ON)
 option(CAIRNKV_BUILD_CLIENT "Build libcairnkv" ON)
 option(CAIRNKV_BUILD_TOOLS "Build cairnctl" ON)
 option(CAIRNKV_BUILD_BENCH "Build cairnkv-bench" ON)
+option(CAIRNKV_BUILD_EXAMPLES "Build SDK examples" ON)
 option(CAIRNKV_BUILD_TESTS "Build tests" ON)
 
 find_package(Threads REQUIRED)
@@ -40,6 +41,10 @@ add_subdirectory(tools/cairnctl)
 
 if (CAIRNKV_BUILD_BENCH)
     add_subdirectory(tools/cairnkv-bench)
+endif()
+
+if (CAIRNKV_BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()
 
 if (CAIRNKV_BUILD_SERVER)

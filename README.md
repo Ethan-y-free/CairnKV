@@ -73,6 +73,15 @@ ctest --test-dir build --output-on-failure
 
 预期：`encoding_test`、`wal_test`、`hard_state_test`、`state_machine_test`、`kv_service_test`、`raft_message_test`、`raft_node_test` 全部通过。
 
+## 示例
+
+`examples/basic.cc` 演示 `libcairnkv` 的基本用法：Put/Get（线性一致与 stale）、Scan、Delete、集群状态。
+
+```bash
+cmake --build build --target cairnkv-example-basic
+./build/examples/cairnkv-example-basic --addr 127.0.0.1:6666
+```
+
 ## 压测
 
 ```bash
