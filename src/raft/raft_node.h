@@ -117,6 +117,15 @@ private:
 
     using Clock = std::chrono::steady_clock;
 
+    // One AppendEntries batch that has been sent but not acknowledged yet.
+    // The leader allows at most kMaxInflight of these per follower.
+    struct InflightBatch
+    {
+        uint64_t last_index = 0;
+        uint64_t prev_index = 0;
+        Clock::time_point sent_at;
+    };
+
     void Enqueue(std::function<void()> task);
     void Run();
     void RunWal();
@@ -138,8 +147,10 @@ private:
     void BecomeFollower(uint64_t term, const std::string& leader_id);
     void BecomeLeader();
 
-    void SendAppendEntries(const std::string& peer_id);
-    void BroadcastAppendEntries();
+    void MaybeSendAppendEntries(const std::string& peer_id,
+                                bool send_heartbeat);
+    void BroadcastAppendEntries(bool send_heartbeat);
+    void RetryTimedOutInflight();
     void AdvanceCommitIndex();
     void ApplyCommitted();
     void FailPendingWrites(const Status& status);
@@ -175,8 +186,11 @@ private:
     uint64_t commit_index_ = 0;
     uint64_t last_applied_ = 0;
 
+    // next_index_ advances optimistically when a batch is sent; match_index_
+    // only advances on successful responses. inflight_ tracks the gap.
     std::map<std::string, uint64_t> next_index_;
     std::map<std::string, uint64_t> match_index_;
+    std::map<std::string, std::deque<InflightBatch>> inflight_;
     std::set<std::string> votes_received_;
     std::map<uint64_t, std::shared_ptr<std::promise<StatusOr<uint64_t>>>>
         pending_writes_;

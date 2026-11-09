@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -14,8 +15,10 @@
 namespace cairnkv
 {
 
-// A blocking, one-in-flight-in-per-peer transport for Raft messages.
-// It runs on its own thread so the Raft core never blocks on network I/O.
+// Pipelined transport for Raft messages. One thread sends without waiting for
+// responses; another receives responses and hands them to the Raft core via
+// the callback. The leader bounds the number of in-flight batches, so the send
+// queue stays small and messages are not silently dropped.
 class PeerClient
 {
 public:
@@ -31,33 +34,42 @@ public:
 
     void Start();
     void Stop();
-    void Send(const RaftMessage& message);
+
+    // Returns false when the client is stopped or blocked, or when the send
+    // queue is full. Callers must rewind their optimistic replication state.
+    bool Send(const RaftMessage& message);
 
     // Diagnostics: number of messages waiting to be sent to this peer.
     size_t QueueDepth();
 
-    // Test/ops hook: drop outgoing traffic to this peer.
+    // Test/ops hook: drop all traffic to and from this peer.
     void SetBlocked(bool blocked);
 
 private:
-    void Run();
+    void SendLoop();
+    void ReceiveLoop();
     bool Connect();
-    void Close();
-    bool SendFrame(const std::string& frame);
-    bool ReceiveFrame(std::string* payload);
+    int GetFd();
+    void CloseFd(int expected_fd);
+    bool SendFrame(int fd, const std::string& frame);
+    bool ReceiveFrame(int fd, std::string* payload);
 
     std::string peer_id_;
     std::string address_;
     ResponseCallback callback_;
 
-    std::thread thread_;
+    std::thread send_thread_;
+    std::thread recv_thread_;
+
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<RaftMessage> queue_;
     bool running_ = false;
     bool blocked_ = false;
+
+    std::mutex fd_mutex_;
     int fd_ = -1;
-    uint64_t next_request_id_ = 1;
+    std::atomic<uint64_t> next_request_id_{1};
 };
 
 }

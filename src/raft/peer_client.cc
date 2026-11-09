@@ -8,6 +8,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <thread>
 #include <unistd.h>
 #include <utility>
 
@@ -92,7 +93,8 @@ void PeerClient::Start()
         return;
     }
     running_ = true;
-    thread_ = std::thread([this] { Run(); });
+    send_thread_ = std::thread([this] { SendLoop(); });
+    recv_thread_ = std::thread([this] { ReceiveLoop(); });
 }
 
 void PeerClient::Stop()
@@ -102,28 +104,39 @@ void PeerClient::Stop()
         running_ = false;
     }
     cv_.notify_all();
-    if (thread_.joinable())
+    if (send_thread_.joinable())
     {
-        thread_.join();
+        send_thread_.join();
     }
-    Close();
+    if (recv_thread_.joinable())
+    {
+        recv_thread_.join();
+    }
+
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    if (fd_ >= 0)
+    {
+        ::close(fd_);
+        fd_ = -1;
+    }
 }
 
-void PeerClient::Send(const RaftMessage& message)
+bool PeerClient::Send(const RaftMessage& message)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ || blocked_)
         {
-            return;
+            return false;
         }
         if (queue_.size() >= kMaxQueue)
         {
-            queue_.pop_front();
+            return false;
         }
         queue_.push_back(message);
     }
     cv_.notify_one();
+    return true;
 }
 
 size_t PeerClient::QueueDepth()
@@ -148,8 +161,30 @@ void PeerClient::SetBlocked(bool blocked)
     }
 }
 
+int PeerClient::GetFd()
+{
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    return fd_;
+}
+
+void PeerClient::CloseFd(int expected_fd)
+{
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    if (fd_ == expected_fd)
+    {
+        ::close(fd_);
+        fd_ = -1;
+    }
+}
+
 bool PeerClient::Connect()
 {
+    std::lock_guard<std::mutex> lock(fd_mutex_);
+    if (fd_ >= 0)
+    {
+        return true;
+    }
+
     std::string host;
     uint16_t port = 0;
     if (!net::ParseAddress(address_, &host, &port))
@@ -207,24 +242,15 @@ bool PeerClient::Connect()
     return true;
 }
 
-void PeerClient::Close()
+bool PeerClient::SendFrame(int fd, const std::string& frame)
 {
-    if (fd_ >= 0)
-    {
-        ::close(fd_);
-        fd_ = -1;
-    }
+    return SendAll(fd, frame.data(), frame.size()).ok();
 }
 
-bool PeerClient::SendFrame(const std::string& frame)
-{
-    return SendAll(fd_, frame.data(), frame.size()).ok();
-}
-
-bool PeerClient::ReceiveFrame(std::string* payload)
+bool PeerClient::ReceiveFrame(int fd, std::string* payload)
 {
     std::string header(kFrameHeaderSize, '\0');
-    if (!RecvExact(fd_, header.data(), header.size()).ok())
+    if (!RecvExact(fd, header.data(), header.size()).ok())
     {
         return false;
     }
@@ -246,7 +272,7 @@ bool PeerClient::ReceiveFrame(std::string* payload)
 
     std::string data = header;
     data.resize(kFrameHeaderSize + payload_len + 4);
-    if (!RecvExact(fd_, data.data() + kFrameHeaderSize, payload_len + 4).ok())
+    if (!RecvExact(fd, data.data() + kFrameHeaderSize, payload_len + 4).ok())
     {
         return false;
     }
@@ -265,7 +291,7 @@ bool PeerClient::ReceiveFrame(std::string* payload)
     return true;
 }
 
-void PeerClient::Run()
+void PeerClient::SendLoop()
 {
     while (true)
     {
@@ -277,62 +303,81 @@ void PeerClient::Run()
             {
                 break;
             }
+            if (blocked_)
+            {
+                queue_.clear();
+                continue;
+            }
             message = std::move(queue_.front());
             queue_.pop_front();
         }
 
+        int fd = GetFd();
+        if (fd < 0)
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (blocked_)
+            if (!Connect())
             {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
-        }
-
-        if (fd_ < 0 && !Connect())
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
+            fd = GetFd();
         }
 
         const std::string payload = EncodeRaftMessage(message);
-        const std::string frame = EncodeFrame(MessageType::kRaftRequest,
-                                              next_request_id_++,
-                                              payload);
-        if (!SendFrame(frame))
+        const std::string frame = EncodeFrame(
+            MessageType::kRaftRequest,
+            next_request_id_.fetch_add(1, std::memory_order_relaxed),
+            payload);
+        if (!SendFrame(fd, frame))
         {
-            Close();
-            continue;
+            CloseFd(fd);
         }
+    }
+}
 
-        std::string response_payload;
-        if (!ReceiveFrame(&response_payload))
-        {
-            Close();
-            continue;
-        }
-
-        StatusOr<RaftMessage> response = DecodeRaftMessage(response_payload);
-        if (!response.ok())
-        {
-            Close();
-            continue;
-        }
-
+void PeerClient::ReceiveLoop()
+{
+    while (true)
+    {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (blocked_)
+            if (!running_)
             {
-                continue;
+                break;
             }
         }
-        if (callback_)
+
+        const int fd = GetFd();
+        if (fd < 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        std::string payload;
+        if (!ReceiveFrame(fd, &payload))
+        {
+            CloseFd(fd);
+            continue;
+        }
+
+        StatusOr<RaftMessage> response = DecodeRaftMessage(payload);
+        if (!response.ok())
+        {
+            CloseFd(fd);
+            continue;
+        }
+
+        bool deliver = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            deliver = running_ && !blocked_;
+        }
+        if (deliver && callback_)
         {
             callback_(*response);
         }
     }
-
-    Close();
 }
 
 }

@@ -15,6 +15,8 @@ namespace
 
 constexpr auto kRaftRequestTimeout = std::chrono::milliseconds(1000);
 constexpr size_t kMaxPendingCommits = 4096;
+constexpr size_t kMaxInflight = 4;
+constexpr auto kInflightTimeout = std::chrono::milliseconds(1000);
 
 uint64_t DurationNs(std::chrono::steady_clock::time_point start,
                     std::chrono::steady_clock::time_point end)
@@ -278,9 +280,7 @@ void RaftNode::OnWalSynced(std::vector<PendingCommit> batch,
         pending_writes_[pending.index] = std::move(pending.promise);
     }
 
-    // Stage two (pipelined replication) replaces this broadcast with a
-    // per-peer MaybeSend driven by in-flight windows.
-    BroadcastAppendEntries();
+    BroadcastAppendEntries(false);
 
     if (Majority() == 1)
     {
@@ -321,9 +321,10 @@ void RaftNode::OnTimeout()
     {
         if (now >= heartbeat_deadline_)
         {
-            BroadcastAppendEntries();
+            BroadcastAppendEntries(true);
             ResetHeartbeatDeadline();
         }
+        RetryTimedOutInflight();
         return;
     }
 
@@ -406,16 +407,20 @@ void RaftNode::LogMetrics()
     {
         const auto next_it = next_index_.find(peer_id);
         const auto match_it = match_index_.find(peer_id);
+        const auto inflight_it = inflight_.find(peer_id);
         const uint64_t next =
             next_it == next_index_.end() ? 0 : next_it->second;
         const uint64_t match =
             match_it == match_index_.end() ? 0 : match_it->second;
+        const size_t inflight =
+            inflight_it == inflight_.end() ? 0 : inflight_it->second.size();
         if (!peers.empty())
         {
             peers += " ";
         }
         peers += peer_id + " next=" + std::to_string(next) +
                  " match=" + std::to_string(match) +
+                 " inflight=" + std::to_string(inflight) +
                  " q=" + std::to_string(client->QueueDepth());
     }
 
@@ -570,6 +575,7 @@ void RaftNode::BecomeFollower(uint64_t term, const std::string& new_leader_id)
     votes_received_.clear();
     next_index_.clear();
     match_index_.clear();
+    inflight_.clear();
     ResetElectionDeadline();
     FailPendingWrites(NotLeaderStatusUnlocked());
     FailReadRequests(NotLeaderStatusUnlocked());
@@ -585,11 +591,13 @@ void RaftNode::BecomeLeader()
 
     next_index_.clear();
     match_index_.clear();
+    inflight_.clear();
     for (const auto& [peer_id, client] : peer_clients_)
     {
         (void)client;
         next_index_[peer_id] = log_.LastIndex() + 1;
         match_index_[peer_id] = 0;
+        inflight_[peer_id].clear();
     }
 
     LogEntry noop;
@@ -608,6 +616,7 @@ void RaftNode::BecomeLeader()
         BecomeFollower(current_term_, "");
         return;
     }
+    last_synced_index_ = std::max(last_synced_index_, noop.index);
 
     leader_noop_index_ = noop.index;
     leader_ready_ = false;
@@ -616,7 +625,7 @@ void RaftNode::BecomeLeader()
     CAIRNKV_LOG_INFO("node " << options_.node_id << " became leader for term "
                              << current_term_);
 
-    BroadcastAppendEntries();
+    BroadcastAppendEntries(false);
 
     if (Majority() == 1)
     {
@@ -627,37 +636,115 @@ void RaftNode::BecomeLeader()
     }
 }
 
-void RaftNode::SendAppendEntries(const std::string& peer_id)
+void RaftNode::MaybeSendAppendEntries(const std::string& peer_id,
+                                      bool send_heartbeat)
 {
     if (role_ != NodeRole::kLeader)
+    {
+        return;
+    }
+    if (IsPeerBlocked(peer_id))
     {
         return;
     }
 
     auto next_it = next_index_.find(peer_id);
     auto client_it = peer_clients_.find(peer_id);
-    if (next_it == next_index_.end() || client_it == peer_clients_.end())
+    auto inflight_it = inflight_.find(peer_id);
+    if (next_it == next_index_.end() || client_it == peer_clients_.end() ||
+        inflight_it == inflight_.end())
     {
         return;
     }
 
+    std::deque<InflightBatch>& inflight = inflight_it->second;
     const uint64_t last_index = log_.LastIndex();
-    uint64_t next = next_it->second;
-    if (next == 0)
+    if (next_it->second == 0)
     {
-        next = 1;
+        next_it->second = 1;
     }
-    if (next > last_index + 1)
+    if (next_it->second > last_index + 1)
     {
-        next = last_index + 1;
+        next_it->second = last_index + 1;
     }
-    next_it->second = next;
 
-    const uint64_t prev_index = next > 0 ? next - 1 : 0;
-    uint64_t prev_term = 0;
-    if (prev_index > 0)
+    while (next_it->second <= last_index && inflight.size() < kMaxInflight)
     {
-        StatusOr<LogEntry> prev = log_.Get(prev_index);
+        const uint64_t batch_start = next_it->second;
+        const uint64_t prev_index = batch_start - 1;
+        uint64_t prev_term = 0;
+        if (prev_index > 0)
+        {
+            StatusOr<LogEntry> prev = log_.Get(prev_index);
+            if (!prev.ok())
+            {
+                return;
+            }
+            prev_term = prev->term;
+        }
+
+        RaftMessage message;
+        message.type = RaftMessageType::kAppendEntries;
+        message.term = current_term_;
+        message.from_id = options_.node_id;
+        message.to_id = peer_id;
+        message.leader_id = options_.node_id;
+        message.prev_log_index = prev_index;
+        message.prev_log_term = prev_term;
+        message.leader_commit = commit_index_;
+
+        for (uint64_t index = batch_start;
+             index <= last_index && message.entries.size() < 64;
+             ++index)
+        {
+            StatusOr<LogEntry> entry = log_.Get(index);
+            if (!entry.ok())
+            {
+                break;
+            }
+            message.entries.push_back(*entry);
+        }
+        if (message.entries.empty())
+        {
+            return;
+        }
+
+        const uint64_t batch_last = message.entries.back().index;
+
+        InflightBatch batch;
+        batch.last_index = batch_last;
+        batch.prev_index = prev_index;
+        batch.sent_at = Clock::now();
+        inflight.push_back(batch);
+        next_it->second = batch_last + 1;
+
+        metrics_.appends_sent.fetch_add(1, std::memory_order_relaxed);
+        metrics_.sends_with_entries.fetch_add(1, std::memory_order_relaxed);
+
+        if (!client_it->second->Send(message))
+        {
+            // Queue full or peer blocked: undo the optimistic state so the
+            // next attempt retries these entries instead of skipping them.
+            inflight.pop_back();
+            next_it->second = batch_start;
+            return;
+        }
+    }
+
+    if (!send_heartbeat)
+    {
+        return;
+    }
+    // Entries still in flight already refresh the follower's election timer.
+    if (next_it->second <= last_index || inflight.size() >= kMaxInflight)
+    {
+        return;
+    }
+
+    uint64_t prev_term = 0;
+    if (last_index > 0)
+    {
+        StatusOr<LogEntry> prev = log_.Get(last_index);
         if (!prev.ok())
         {
             return;
@@ -665,41 +752,32 @@ void RaftNode::SendAppendEntries(const std::string& peer_id)
         prev_term = prev->term;
     }
 
-    RaftMessage message;
-    message.type = RaftMessageType::kAppendEntries;
-    message.term = current_term_;
-    message.from_id = options_.node_id;
-    message.to_id = peer_id;
-    message.leader_id = options_.node_id;
-    message.prev_log_index = prev_index;
-    message.prev_log_term = prev_term;
-    message.leader_commit = commit_index_;
+    RaftMessage heartbeat;
+    heartbeat.type = RaftMessageType::kAppendEntries;
+    heartbeat.term = current_term_;
+    heartbeat.from_id = options_.node_id;
+    heartbeat.to_id = peer_id;
+    heartbeat.leader_id = options_.node_id;
+    heartbeat.prev_log_index = last_index;
+    heartbeat.prev_log_term = prev_term;
+    heartbeat.leader_commit = commit_index_;
 
-    for (uint64_t index = next;
-         index <= last_index && message.entries.size() < 64;
-         ++index)
-    {
-        StatusOr<LogEntry> entry = log_.Get(index);
-        if (!entry.ok())
-        {
-            break;
-        }
-        message.entries.push_back(*entry);
-    }
+    InflightBatch batch;
+    batch.last_index = last_index;
+    batch.prev_index = last_index;
+    batch.sent_at = Clock::now();
+    inflight.push_back(batch);
 
     metrics_.appends_sent.fetch_add(1, std::memory_order_relaxed);
-    if (message.entries.empty())
+    metrics_.sends_empty.fetch_add(1, std::memory_order_relaxed);
+
+    if (!client_it->second->Send(heartbeat))
     {
-        metrics_.sends_empty.fetch_add(1, std::memory_order_relaxed);
+        inflight.pop_back();
     }
-    else
-    {
-        metrics_.sends_with_entries.fetch_add(1, std::memory_order_relaxed);
-    }
-    client_it->second->Send(message);
 }
 
-void RaftNode::BroadcastAppendEntries()
+void RaftNode::BroadcastAppendEntries(bool send_heartbeat)
 {
     if (role_ != NodeRole::kLeader)
     {
@@ -708,7 +786,39 @@ void RaftNode::BroadcastAppendEntries()
     for (const auto& [peer_id, client] : peer_clients_)
     {
         (void)client;
-        SendAppendEntries(peer_id);
+        MaybeSendAppendEntries(peer_id, send_heartbeat);
+    }
+}
+
+void RaftNode::RetryTimedOutInflight()
+{
+    if (role_ != NodeRole::kLeader)
+    {
+        return;
+    }
+
+    const Clock::time_point now = Clock::now();
+    for (auto& [peer_id, inflight] : inflight_)
+    {
+        if (inflight.empty() ||
+            now - inflight.front().sent_at < kInflightTimeout)
+        {
+            continue;
+        }
+
+        auto next_it = next_index_.find(peer_id);
+        auto match_it = match_index_.find(peer_id);
+        if (next_it == next_index_.end() || match_it == match_index_.end())
+        {
+            continue;
+        }
+
+        // A response was lost (or the peer stalled). Rewind to the last
+        // confirmed entry and drop every in-flight batch, since they were all
+        // built on the same unconfirmed prefix.
+        next_it->second = match_it->second + 1;
+        inflight.clear();
+        MaybeSendAppendEntries(peer_id, false);
     }
 }
 
@@ -1075,6 +1185,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
             votes_received_.clear();
             next_index_.clear();
             match_index_.clear();
+            inflight_.clear();
             FailPendingWrites(NotLeaderStatusUnlocked());
         }
         ResetElectionDeadline();
@@ -1217,7 +1328,9 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
 
     auto next_it = next_index_.find(response.from_id);
     auto match_it = match_index_.find(response.from_id);
-    if (next_it == next_index_.end() || match_it == match_index_.end())
+    auto inflight_it = inflight_.find(response.from_id);
+    if (next_it == next_index_.end() || match_it == match_index_.end() ||
+        inflight_it == inflight_.end())
     {
         return;
     }
@@ -1230,32 +1343,40 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
         {
             match_it->second = match;
         }
-        next_it->second = match_it->second + 1;
-        AdvanceCommitIndex();
-
-        // Only continue when this peer still has entries to catch up on.
-        // Replying to an empty heartbeat must not start another
-        // AppendEntries, otherwise leader and follower ping-pong forever
-        // and starve client proposals behind the peer send queue.
-        if (next_it->second <= log_.LastIndex())
+        // next_index_ is optimistic, so normally it is already ahead. Only
+        // correct it when it fell behind confirmed progress.
+        if (next_it->second <= match_it->second)
         {
-            SendAppendEntries(response.from_id);
+            next_it->second = match_it->second + 1;
         }
+
+        std::deque<InflightBatch>& inflight = inflight_it->second;
+        while (!inflight.empty() &&
+               inflight.front().last_index <= match_it->second)
+        {
+            inflight.pop_front();
+        }
+
+        AdvanceCommitIndex();
+        MaybeSendAppendEntries(response.from_id, false);
     }
     else
     {
         metrics_.responses_failure.fetch_add(1, std::memory_order_relaxed);
         uint64_t next = response.match_index + 1;
-        if (next < 1)
+        if (next < match_it->second + 1)
         {
-            next = 1;
+            next = match_it->second + 1;
         }
-        if (next > log_.LastIndex() + 1)
+        // A failure never moves the send cursor forward.
+        if (next > next_it->second)
         {
-            next = log_.LastIndex() + 1;
+            next = next_it->second;
         }
         next_it->second = next;
-        SendAppendEntries(response.from_id);
+        // Every in-flight batch was built on the rejected prefix.
+        inflight_it->second.clear();
+        MaybeSendAppendEntries(response.from_id, false);
     }
 }
 
