@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(CAIRNKV_BUILD_SERVER "Build cairnkd" ON)
 option(CAIRNKV_BUILD_CLIENT "Build libcairnkv" ON)
 option(CAIRNKV_BUILD_TOOLS "Build cairnctl" ON)
+option(CAIRNKV_BUILD_BENCH "Build cairnkv-bench" ON)
 option(CAIRNKV_BUILD_TESTS "Build tests" ON)
 
 find_package(Threads REQUIRED)
@@ -36,6 +37,10 @@ add_subdirectory(src/rpc)
 add_subdirectory(src/consensus)
 add_subdirectory(src/client)
 add_subdirectory(tools/cairnctl)
+
+if (CAIRNKV_BUILD_BENCH)
+    add_subdirectory(tools/cairnkv-bench)
+endif()
 
 if (CAIRNKV_BUILD_SERVER)
     add_executable(cairnkd src/server/node_main.cc)

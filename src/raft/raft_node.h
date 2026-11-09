@@ -84,11 +84,33 @@ private:
         std::shared_ptr<std::promise<StatusOr<GetResult>>> promise;
     };
 
+    struct Metrics
+    {
+        std::atomic<uint64_t> proposals{0};
+        std::atomic<uint64_t> append_ns{0};
+        std::atomic<uint64_t> sync_calls{0};
+        std::atomic<uint64_t> sync_ns{0};
+        std::atomic<uint64_t> appends_sent{0};
+        std::atomic<uint64_t> sends_empty{0};
+        std::atomic<uint64_t> sends_with_entries{0};
+        std::atomic<uint64_t> responses{0};
+        std::atomic<uint64_t> responses_success{0};
+        std::atomic<uint64_t> responses_failure{0};
+        std::atomic<uint64_t> append_requests{0};
+        std::atomic<uint64_t> reject_prev{0};
+        std::atomic<uint64_t> reject_term{0};
+        std::atomic<uint64_t> reject_gap{0};
+        std::atomic<uint64_t> appended_entries{0};
+        std::atomic<uint64_t> apply_calls{0};
+        std::atomic<uint64_t> apply_ns{0};
+    };
+
     using Clock = std::chrono::steady_clock;
 
     void Enqueue(std::function<void()> task);
     void Run();
     void OnTimeout();
+    void LogMetrics();
     void ResetElectionDeadline();
     void ResetHeartbeatDeadline();
 
@@ -167,6 +189,25 @@ private:
     Clock::time_point election_deadline_;
     Clock::time_point heartbeat_deadline_;
     std::mt19937 rng_;
+
+    Metrics metrics_;
+    Clock::time_point last_metrics_log_;
+    uint64_t last_logged_proposals_ = 0;
+    uint64_t last_logged_sync_calls_ = 0;
+    uint64_t last_logged_sync_ns_ = 0;
+    uint64_t last_logged_apply_calls_ = 0;
+    uint64_t last_logged_apply_ns_ = 0;
+    uint64_t last_logged_appends_sent_ = 0;
+    uint64_t last_logged_sends_empty_ = 0;
+    uint64_t last_logged_sends_with_entries_ = 0;
+    uint64_t last_logged_responses_ = 0;
+    uint64_t last_logged_responses_success_ = 0;
+    uint64_t last_logged_responses_failure_ = 0;
+    uint64_t last_logged_append_requests_ = 0;
+    uint64_t last_logged_reject_prev_ = 0;
+    uint64_t last_logged_reject_term_ = 0;
+    uint64_t last_logged_reject_gap_ = 0;
+    uint64_t last_logged_appended_entries_ = 0;
 };
 
 }

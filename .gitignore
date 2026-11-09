@@ -10,4 +10,5 @@ CMakeSettings.json
 *.exe
 *.pdb
 *.log
+!docs/benchmarks/results/**/*.log
 data/

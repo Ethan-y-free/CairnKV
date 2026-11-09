@@ -33,6 +33,9 @@ public:
     void Stop();
     void Send(const RaftMessage& message);
 
+    // Diagnostics: number of messages waiting to be sent to this peer.
+    size_t QueueDepth();
+
     // Test/ops hook: drop outgoing traffic to this peer.
     void SetBlocked(bool blocked);
 

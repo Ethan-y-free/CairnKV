@@ -15,6 +15,14 @@ namespace
 
 constexpr auto kRaftRequestTimeout = std::chrono::milliseconds(1000);
 
+uint64_t DurationNs(std::chrono::steady_clock::time_point start,
+                    std::chrono::steady_clock::time_point end)
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+            .count());
+}
+
 }
 
 RaftNode::RaftNode(Options options)
@@ -81,6 +89,7 @@ Status RaftNode::Start()
         peer_clients_[peer_id] = std::move(client);
     }
 
+    last_metrics_log_ = Clock::now();
     thread_ = std::thread([this] { Run(); });
     return Status::Ok();
 }
@@ -123,6 +132,13 @@ void RaftNode::Run()
 
     while (running_.load())
     {
+        const Clock::time_point metrics_now = Clock::now();
+        if (metrics_now - last_metrics_log_ >= std::chrono::seconds(1))
+        {
+            LogMetrics();
+            last_metrics_log_ = metrics_now;
+        }
+
         std::function<void()> task;
         {
             std::unique_lock<std::mutex> lock(mutex_);
@@ -174,6 +190,155 @@ void RaftNode::OnTimeout()
     {
         StartElection();
     }
+}
+
+void RaftNode::LogMetrics()
+{
+    const uint64_t proposals =
+        metrics_.proposals.load(std::memory_order_relaxed);
+    const uint64_t sync_calls =
+        metrics_.sync_calls.load(std::memory_order_relaxed);
+    const uint64_t sync_ns = metrics_.sync_ns.load(std::memory_order_relaxed);
+    const uint64_t apply_calls =
+        metrics_.apply_calls.load(std::memory_order_relaxed);
+    const uint64_t apply_ns =
+        metrics_.apply_ns.load(std::memory_order_relaxed);
+    const uint64_t appends_sent =
+        metrics_.appends_sent.load(std::memory_order_relaxed);
+    const uint64_t sends_empty =
+        metrics_.sends_empty.load(std::memory_order_relaxed);
+    const uint64_t sends_with_entries =
+        metrics_.sends_with_entries.load(std::memory_order_relaxed);
+    const uint64_t responses =
+        metrics_.responses.load(std::memory_order_relaxed);
+    const uint64_t responses_success =
+        metrics_.responses_success.load(std::memory_order_relaxed);
+    const uint64_t responses_failure =
+        metrics_.responses_failure.load(std::memory_order_relaxed);
+    const uint64_t append_requests =
+        metrics_.append_requests.load(std::memory_order_relaxed);
+    const uint64_t reject_prev =
+        metrics_.reject_prev.load(std::memory_order_relaxed);
+    const uint64_t reject_term =
+        metrics_.reject_term.load(std::memory_order_relaxed);
+    const uint64_t reject_gap =
+        metrics_.reject_gap.load(std::memory_order_relaxed);
+    const uint64_t appended_entries =
+        metrics_.appended_entries.load(std::memory_order_relaxed);
+
+    const uint64_t sync_delta = sync_calls - last_logged_sync_calls_;
+    const uint64_t sync_ns_delta = sync_ns - last_logged_sync_ns_;
+    const uint64_t apply_delta = apply_calls - last_logged_apply_calls_;
+    const uint64_t apply_ns_delta = apply_ns - last_logged_apply_ns_;
+    const uint64_t appends_delta = appends_sent - last_logged_appends_sent_;
+    const uint64_t sends_empty_delta = sends_empty - last_logged_sends_empty_;
+    const uint64_t sends_entries_delta =
+        sends_with_entries - last_logged_sends_with_entries_;
+    const uint64_t responses_delta = responses - last_logged_responses_;
+    const uint64_t responses_success_delta =
+        responses_success - last_logged_responses_success_;
+    const uint64_t responses_failure_delta =
+        responses_failure - last_logged_responses_failure_;
+    const uint64_t append_requests_delta =
+        append_requests - last_logged_append_requests_;
+    const uint64_t reject_prev_delta = reject_prev - last_logged_reject_prev_;
+    const uint64_t reject_term_delta = reject_term - last_logged_reject_term_;
+    const uint64_t reject_gap_delta = reject_gap - last_logged_reject_gap_;
+    const uint64_t appended_entries_delta =
+        appended_entries - last_logged_appended_entries_;
+
+    if (proposals == last_logged_proposals_ && sync_delta == 0 &&
+        apply_delta == 0 && appends_delta == 0 && responses_delta == 0 &&
+        append_requests_delta == 0 && pending_writes_.empty())
+    {
+        return;
+    }
+
+    size_t queue_depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_depth = queue_.size();
+    }
+
+    std::string peers;
+    for (const auto& [peer_id, client] : peer_clients_)
+    {
+        const auto next_it = next_index_.find(peer_id);
+        const auto match_it = match_index_.find(peer_id);
+        const uint64_t next =
+            next_it == next_index_.end() ? 0 : next_it->second;
+        const uint64_t match =
+            match_it == match_index_.end() ? 0 : match_it->second;
+        if (!peers.empty())
+        {
+            peers += " ";
+        }
+        peers += peer_id + " next=" + std::to_string(next) +
+                 " match=" + std::to_string(match) +
+                 " q=" + std::to_string(client->QueueDepth());
+    }
+
+    const double sync_avg_us =
+        sync_delta == 0
+            ? 0.0
+            : static_cast<double>(sync_ns_delta) /
+                  static_cast<double>(sync_delta) / 1000.0;
+    const double apply_avg_us =
+        apply_delta == 0
+            ? 0.0
+            : static_cast<double>(apply_ns_delta) /
+                  static_cast<double>(apply_delta) / 1000.0;
+
+    const char* role = "follower";
+    if (role_ == NodeRole::kLeader)
+    {
+        role = "leader";
+    }
+    else if (role_ == NodeRole::kCandidate)
+    {
+        role = "candidate";
+    }
+
+    CAIRNKV_LOG_INFO("raft metrics: role="
+                     << role << " proposals=" << proposals
+                     << " pending=" << pending_writes_.size()
+                     << " qdepth=" << queue_depth
+                     << " appends=" << appends_delta
+                     << " empty=" << sends_empty_delta
+                     << " with_entries=" << sends_entries_delta
+                     << " responses=" << responses_delta
+                     << " ok=" << responses_success_delta
+                     << " fail=" << responses_failure_delta
+                     << " append_req=" << append_requests_delta
+                     << " rej_prev=" << reject_prev_delta
+                     << " rej_term=" << reject_term_delta
+                     << " rej_gap=" << reject_gap_delta
+                     << " appended=" << appended_entries_delta
+                     << " sync=" << sync_delta
+                     << " sync_avg_us=" << sync_avg_us
+                     << " apply=" << apply_delta
+                     << " apply_avg_us=" << apply_avg_us
+                     << " last_index=" << log_.LastIndex()
+                     << " commit=" << commit_index_
+                     << " applied=" << last_applied_ << " peers=[" << peers
+                     << "]");
+
+    last_logged_proposals_ = proposals;
+    last_logged_sync_calls_ = sync_calls;
+    last_logged_sync_ns_ = sync_ns;
+    last_logged_apply_calls_ = apply_calls;
+    last_logged_apply_ns_ = apply_ns;
+    last_logged_appends_sent_ = appends_sent;
+    last_logged_sends_empty_ = sends_empty;
+    last_logged_sends_with_entries_ = sends_with_entries;
+    last_logged_responses_ = responses;
+    last_logged_responses_success_ = responses_success;
+    last_logged_responses_failure_ = responses_failure;
+    last_logged_append_requests_ = append_requests;
+    last_logged_reject_prev_ = reject_prev;
+    last_logged_reject_term_ = reject_term;
+    last_logged_reject_gap_ = reject_gap;
+    last_logged_appended_entries_ = appended_entries;
 }
 
 void RaftNode::ResetElectionDeadline()
@@ -378,6 +543,15 @@ void RaftNode::SendAppendEntries(const std::string& peer_id)
         message.entries.push_back(*entry);
     }
 
+    metrics_.appends_sent.fetch_add(1, std::memory_order_relaxed);
+    if (message.entries.empty())
+    {
+        metrics_.sends_empty.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        metrics_.sends_with_entries.fetch_add(1, std::memory_order_relaxed);
+    }
     client_it->second->Send(message);
 }
 
@@ -442,7 +616,12 @@ void RaftNode::ApplyCommitted()
             return;
         }
 
+        const Clock::time_point apply_start = Clock::now();
         Status status = state_.Apply(*entry);
+        const Clock::time_point apply_end = Clock::now();
+        metrics_.apply_calls.fetch_add(1, std::memory_order_relaxed);
+        metrics_.apply_ns.fetch_add(DurationNs(apply_start, apply_end),
+                                    std::memory_order_relaxed);
         if (!status.ok())
         {
             CAIRNKV_LOG_ERROR("state machine apply failed at index "
@@ -726,9 +905,11 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
     response.success = false;
     response.match_index = log_.LastIndex();
     response.read_context = request.read_context;
+    metrics_.append_requests.fetch_add(1, std::memory_order_relaxed);
 
     if (request.term < current_term_)
     {
+        metrics_.reject_term.fetch_add(1, std::memory_order_relaxed);
         return response;
     }
 
@@ -753,6 +934,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
 
     if (request.prev_log_index > log_.LastIndex())
     {
+        metrics_.reject_prev.fetch_add(1, std::memory_order_relaxed);
         response.match_index = log_.LastIndex();
         return response;
     }
@@ -762,6 +944,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
         StatusOr<LogEntry> prev = log_.Get(request.prev_log_index);
         if (!prev.ok() || prev->term != request.prev_log_term)
         {
+            metrics_.reject_term.fetch_add(1, std::memory_order_relaxed);
             response.match_index = request.prev_log_index - 1;
             return response;
         }
@@ -775,6 +958,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
             StatusOr<LogEntry> existing = log_.Get(entry.index);
             if (!existing.ok())
             {
+                metrics_.reject_gap.fetch_add(1, std::memory_order_relaxed);
                 return response;
             }
             if (existing->term == entry.term)
@@ -785,26 +969,35 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
             Status status = log_.TruncateSuffix(entry.index);
             if (!status.ok())
             {
+                metrics_.reject_gap.fetch_add(1, std::memory_order_relaxed);
                 return response;
             }
         }
 
         if (entry.index != log_.LastIndex() + 1)
         {
+            metrics_.reject_gap.fetch_add(1, std::memory_order_relaxed);
             return response;
         }
 
         Status status = log_.Append(entry);
         if (!status.ok())
         {
+            metrics_.reject_gap.fetch_add(1, std::memory_order_relaxed);
             return response;
         }
+        metrics_.appended_entries.fetch_add(1, std::memory_order_relaxed);
         appended = true;
     }
 
     if (appended)
     {
+        const Clock::time_point sync_start = Clock::now();
         Status status = log_.Sync();
+        const Clock::time_point sync_end = Clock::now();
+        metrics_.sync_calls.fetch_add(1, std::memory_order_relaxed);
+        metrics_.sync_ns.fetch_add(DurationNs(sync_start, sync_end),
+                                   std::memory_order_relaxed);
         if (!status.ok())
         {
             return response;
@@ -856,6 +1049,8 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
         return;
     }
 
+    metrics_.responses.fetch_add(1, std::memory_order_relaxed);
+
     if (response.read_context != 0)
     {
         auto read_it = read_rounds_.find(response.read_context);
@@ -879,6 +1074,7 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
 
     if (response.success)
     {
+        metrics_.responses_success.fetch_add(1, std::memory_order_relaxed);
         const uint64_t match = std::min(response.match_index, log_.LastIndex());
         if (match > match_it->second)
         {
@@ -886,10 +1082,19 @@ void RaftNode::HandleAppendEntriesResponse(const RaftMessage& response)
         }
         next_it->second = match_it->second + 1;
         AdvanceCommitIndex();
-        SendAppendEntries(response.from_id);
+
+        // Only continue when this peer still has entries to catch up on.
+        // Replying to an empty heartbeat must not start another
+        // AppendEntries, otherwise leader and follower ping-pong forever
+        // and starve client proposals behind the peer send queue.
+        if (next_it->second <= log_.LastIndex())
+        {
+            SendAppendEntries(response.from_id);
+        }
     }
     else
     {
+        metrics_.responses_failure.fetch_add(1, std::memory_order_relaxed);
         uint64_t next = response.match_index + 1;
         if (next < 1)
         {
@@ -1015,13 +1220,24 @@ StatusOr<uint64_t> RaftNode::ProposeEntry(EntryType type,
         const uint64_t index = log_.LastIndex() + 1;
         const LogEntry entry{index, current_term_, type, key, value};
 
+        const Clock::time_point append_start = Clock::now();
         Status status = log_.Append(entry);
+        const Clock::time_point append_end = Clock::now();
+        metrics_.append_ns.fetch_add(DurationNs(append_start, append_end),
+                                     std::memory_order_relaxed);
         if (!status.ok())
         {
             promise->set_value(StatusOr<uint64_t>(status));
             return;
         }
+
+        const Clock::time_point sync_start = Clock::now();
         status = log_.Sync();
+        const Clock::time_point sync_end = Clock::now();
+        metrics_.sync_calls.fetch_add(1, std::memory_order_relaxed);
+        metrics_.sync_ns.fetch_add(DurationNs(sync_start, sync_end),
+                                   std::memory_order_relaxed);
+        metrics_.proposals.fetch_add(1, std::memory_order_relaxed);
         if (!status.ok())
         {
             promise->set_value(StatusOr<uint64_t>(status));

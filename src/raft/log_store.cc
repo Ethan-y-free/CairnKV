@@ -206,7 +206,11 @@ Status LogStore::Append(const LogEntry& entry)
                 continue;
             }
             // Roll back a partial record so the WAL stays parseable.
-            (void)::ftruncate(fd_, static_cast<off_t>(record_offset));
+            if (::ftruncate(fd_, static_cast<off_t>(record_offset)) != 0)
+            {
+                return Status(StatusCode::kInternal,
+                              ErrnoMessage("truncate partial WAL record"));
+            }
             return Status(StatusCode::kInternal, ErrnoMessage("append WAL"));
         }
         written += static_cast<size_t>(n);

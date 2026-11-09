@@ -126,6 +126,12 @@ void PeerClient::Send(const RaftMessage& message)
     cv_.notify_one();
 }
 
+size_t PeerClient::QueueDepth()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return queue_.size();
+}
+
 void PeerClient::SetBlocked(bool blocked)
 {
     {

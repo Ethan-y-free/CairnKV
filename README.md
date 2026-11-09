@@ -73,6 +73,18 @@ ctest --test-dir build --output-on-failure
 
 预期：`encoding_test`、`wal_test`、`hard_state_test`、`state_machine_test`、`kv_service_test`、`raft_message_test`、`raft_node_test` 全部通过。
 
+## 压测
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release -j
+
+BUILD_DIR=build-release ./scripts/bench.sh single    # 单节点基线
+BUILD_DIR=build-release ./scripts/bench.sh cluster   # 多节点基线
+```
+
+矩阵覆盖 Put（1/8/32 线程）、linearizable Get 与 stale Get；原始 JSON 输出到 `docs/benchmarks/results/<single|cluster>/`，方法与结果见 [v0.4 性能基线](docs/benchmarks/v0.4-baseline.md)。
+
 ## 运行
 
 ```bash
@@ -145,6 +157,7 @@ src/consensus/     RPC server adapter（client dispatch + Raft message dispatch�
 src/server/        kv_service（W1 单节点参考实现）/ cairnkd main
 src/client/        libcairnkv
 tools/cairnctl/    CLI
-scripts/           run-cluster / stop-cluster / cluster-smoke / partition-smoke
+tools/cairnkv-bench/  closed-loop 压测工具
+scripts/           run-cluster / stop-cluster / cluster-smoke / partition-smoke / bench
 tests/             unit tests
 ```
