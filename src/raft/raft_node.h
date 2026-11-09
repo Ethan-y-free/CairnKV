@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -84,6 +85,15 @@ private:
         std::shared_ptr<std::promise<StatusOr<GetResult>>> promise;
     };
 
+    // A proposal waiting for the WAL thread to make its log entry durable.
+    // The core thread appends to the log page cache and hands the commit point
+    // over; the WAL thread batches fdatasync calls and reports back.
+    struct PendingCommit
+    {
+        uint64_t index = 0;
+        std::shared_ptr<std::promise<StatusOr<uint64_t>>> promise;
+    };
+
     struct Metrics
     {
         std::atomic<uint64_t> proposals{0};
@@ -109,6 +119,9 @@ private:
 
     void Enqueue(std::function<void()> task);
     void Run();
+    void RunWal();
+    void OnWalSynced(std::vector<PendingCommit> batch, uint64_t last_index);
+    void OnWalFailed(std::vector<PendingCommit> batch, const Status& status);
     void OnTimeout();
     void LogMetrics();
     void ResetElectionDeadline();
@@ -185,6 +198,17 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<std::function<void()>> queue_;
+
+    // WAL group commit: the core thread appends entries and queues commit
+    // points; the WAL thread drains the queue and fsyncs once per batch.
+    uint64_t last_synced_index_ = 0;
+    std::thread wal_thread_;
+    std::mutex wal_mutex_;
+    std::condition_variable wal_cv_;
+    std::deque<PendingCommit> pending_commits_;
+    std::atomic<size_t> pending_commit_count_{0};
+    bool wal_running_ = false;
+    std::atomic<bool> wal_failed_{false};
 
     Clock::time_point election_deadline_;
     Clock::time_point heartbeat_deadline_;

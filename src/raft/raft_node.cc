@@ -14,6 +14,7 @@ namespace
 {
 
 constexpr auto kRaftRequestTimeout = std::chrono::milliseconds(1000);
+constexpr size_t kMaxPendingCommits = 4096;
 
 uint64_t DurationNs(std::chrono::steady_clock::time_point start,
                     std::chrono::steady_clock::time_point end)
@@ -89,6 +90,11 @@ Status RaftNode::Start()
         peer_clients_[peer_id] = std::move(client);
     }
 
+    // Entries recovered from disk are already durable.
+    last_synced_index_ = log_.LastIndex();
+    wal_running_ = true;
+    wal_thread_ = std::thread([this] { RunWal(); });
+
     last_metrics_log_ = Clock::now();
     thread_ = std::thread([this] { Run(); });
     return Status::Ok();
@@ -103,6 +109,16 @@ void RaftNode::Stop()
         thread_.join();
     }
 
+    {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+        wal_running_ = false;
+    }
+    wal_cv_.notify_all();
+    if (wal_thread_.joinable())
+    {
+        wal_thread_.join();
+    }
+
     for (auto& [peer_id, client] : peer_clients_)
     {
         (void)peer_id;
@@ -111,6 +127,18 @@ void RaftNode::Stop()
 
     FailPendingWrites(Status(StatusCode::kUnavailable, "raft node stopped"));
     FailReadRequests(Status(StatusCode::kUnavailable, "raft node stopped"));
+
+    std::deque<PendingCommit> leftover;
+    {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+        leftover.swap(pending_commits_);
+        pending_commit_count_.store(0);
+    }
+    for (PendingCommit& pending : leftover)
+    {
+        pending.promise->set_value(StatusOr<uint64_t>(
+            Status(StatusCode::kUnavailable, "raft node stopped")));
+    }
 }
 
 void RaftNode::Enqueue(std::function<void()> task)
@@ -170,6 +198,119 @@ void RaftNode::Run()
             }
         }
         task();
+    }
+}
+
+void RaftNode::RunWal()
+{
+    while (true)
+    {
+        std::vector<PendingCommit> batch;
+        uint64_t last_index = 0;
+        {
+            std::unique_lock<std::mutex> lock(wal_mutex_);
+            wal_cv_.wait(lock, [this] {
+                return !wal_running_ || !pending_commits_.empty();
+            });
+            if (!wal_running_)
+            {
+                break;
+            }
+
+            while (!pending_commits_.empty())
+            {
+                batch.push_back(std::move(pending_commits_.front()));
+                pending_commits_.pop_front();
+            }
+            pending_commit_count_.fetch_sub(batch.size(),
+                                            std::memory_order_relaxed);
+            last_index = batch.back().index;
+        }
+
+        const Clock::time_point sync_start = Clock::now();
+        const Status status = log_.Sync();
+        const Clock::time_point sync_end = Clock::now();
+        metrics_.sync_calls.fetch_add(1, std::memory_order_relaxed);
+        metrics_.sync_ns.fetch_add(DurationNs(sync_start, sync_end),
+                                   std::memory_order_relaxed);
+
+        if (!status.ok())
+        {
+            Enqueue([this, batch = std::move(batch), status]() mutable {
+                OnWalFailed(std::move(batch), status);
+            });
+            break;
+        }
+
+        if (!running_.load())
+        {
+            // The core thread is gone; complete the waiters directly.
+            for (PendingCommit& pending : batch)
+            {
+                pending.promise->set_value(StatusOr<uint64_t>(
+                    Status(StatusCode::kUnavailable, "raft node stopped")));
+            }
+            break;
+        }
+
+        Enqueue([this, batch = std::move(batch), last_index]() mutable {
+            OnWalSynced(std::move(batch), last_index);
+        });
+    }
+}
+
+void RaftNode::OnWalSynced(std::vector<PendingCommit> batch,
+                           uint64_t last_index)
+{
+    const uint64_t log_last_index = log_.LastIndex();
+    const uint64_t durable_index = std::min(last_index, log_last_index);
+    last_synced_index_ = std::max(last_synced_index_, durable_index);
+
+    for (PendingCommit& pending : batch)
+    {
+        if (pending.index > log_last_index)
+        {
+            pending.promise->set_value(StatusOr<uint64_t>(Status(
+                StatusCode::kUnavailable,
+                "log truncated before sync completed")));
+            continue;
+        }
+        pending_writes_[pending.index] = std::move(pending.promise);
+    }
+
+    // Stage two (pipelined replication) replaces this broadcast with a
+    // per-peer MaybeSend driven by in-flight windows.
+    BroadcastAppendEntries();
+
+    if (Majority() == 1)
+    {
+        commit_index_ = std::max(commit_index_, durable_index);
+        ApplyCommitted();
+    }
+}
+
+void RaftNode::OnWalFailed(std::vector<PendingCommit> batch,
+                           const Status& status)
+{
+    wal_failed_.store(true);
+    CAIRNKV_LOG_ERROR("WAL sync failed: "
+                      << status.ToString()
+                      << "; new proposals will be rejected");
+
+    for (PendingCommit& pending : batch)
+    {
+        pending.promise->set_value(StatusOr<uint64_t>(status));
+    }
+
+    std::deque<PendingCommit> leftover;
+    {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+        leftover.swap(pending_commits_);
+        pending_commit_count_.store(0);
+    }
+    for (PendingCommit& pending : leftover)
+    {
+        pending.promise->set_value(StatusOr<uint64_t>(status));
     }
 }
 
@@ -318,6 +459,9 @@ void RaftNode::LogMetrics()
                      << " sync_avg_us=" << sync_avg_us
                      << " apply=" << apply_delta
                      << " apply_avg_us=" << apply_avg_us
+                     << " wal_pending="
+                     << pending_commit_count_.load(std::memory_order_relaxed)
+                     << " synced=" << last_synced_index_
                      << " last_index=" << log_.LastIndex()
                      << " commit=" << commit_index_
                      << " applied=" << last_applied_ << " peers=[" << peers
@@ -580,6 +724,11 @@ void RaftNode::AdvanceCommitIndex()
         StatusOr<LogEntry> entry = log_.Get(index);
         if (!entry.ok() || entry->term != current_term_)
         {
+            continue;
+        }
+        if (index > last_synced_index_)
+        {
+            // Never commit an entry before our own WAL is durable.
             continue;
         }
 
@@ -972,6 +1121,7 @@ RaftMessage RaftNode::HandleAppendEntries(const RaftMessage& request)
                 metrics_.reject_gap.fetch_add(1, std::memory_order_relaxed);
                 return response;
             }
+            last_synced_index_ = std::min(last_synced_index_, log_.LastIndex());
         }
 
         if (entry.index != log_.LastIndex() + 1)
@@ -1217,11 +1367,25 @@ StatusOr<uint64_t> RaftNode::ProposeEntry(EntryType type,
             return;
         }
 
+        if (wal_failed_.load(std::memory_order_relaxed))
+        {
+            promise->set_value(StatusOr<uint64_t>(Status(
+                StatusCode::kUnavailable, "wal is in a failed state")));
+            return;
+        }
+        if (pending_commit_count_.load(std::memory_order_relaxed) >=
+            kMaxPendingCommits)
+        {
+            promise->set_value(StatusOr<uint64_t>(Status(
+                StatusCode::kUnavailable, "wal commit queue is full")));
+            return;
+        }
+
         const uint64_t index = log_.LastIndex() + 1;
         const LogEntry entry{index, current_term_, type, key, value};
 
         const Clock::time_point append_start = Clock::now();
-        Status status = log_.Append(entry);
+        const Status status = log_.Append(entry);
         const Clock::time_point append_end = Clock::now();
         metrics_.append_ns.fetch_add(DurationNs(append_start, append_end),
                                      std::memory_order_relaxed);
@@ -1231,27 +1395,13 @@ StatusOr<uint64_t> RaftNode::ProposeEntry(EntryType type,
             return;
         }
 
-        const Clock::time_point sync_start = Clock::now();
-        status = log_.Sync();
-        const Clock::time_point sync_end = Clock::now();
-        metrics_.sync_calls.fetch_add(1, std::memory_order_relaxed);
-        metrics_.sync_ns.fetch_add(DurationNs(sync_start, sync_end),
-                                   std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(wal_mutex_);
+            pending_commits_.push_back(PendingCommit{index, promise});
+            pending_commit_count_.fetch_add(1, std::memory_order_relaxed);
+        }
         metrics_.proposals.fetch_add(1, std::memory_order_relaxed);
-        if (!status.ok())
-        {
-            promise->set_value(StatusOr<uint64_t>(status));
-            return;
-        }
-
-        pending_writes_[index] = promise;
-        BroadcastAppendEntries();
-
-        if (Majority() == 1)
-        {
-            commit_index_ = index;
-            ApplyCommitted();
-        }
+        wal_cv_.notify_one();
     });
 
     const int timeout_ms =
