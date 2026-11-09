@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.1 — Benchmark Baseline & Raft Metrics
+
+### Added
+
+- Closed-loop benchmark client (`tools/cairnkv-bench`) with warmup/measurement barriers, p50–p999 latency, error classification, and server snapshots.
+- `scripts/bench.sh` single/cluster matrix; raw JSON and per-node logs are archived under `docs/benchmarks/results/`.
+- Per-second Raft metrics: proposals, fsync count/latency, apply count/latency, AppendEntries sends/responses/rejections, and per-peer `next`/`match`/queue depth.
+- `docs/benchmarks/v0.4-baseline.md` with the measured baseline and bottleneck analysis.
+
+### Fixed
+
+- Heartbeat ping-pong: an empty AppendEntries response no longer triggers another AppendEntries when the follower is caught up.
+- `LogStore::Append` now checks the `ftruncate` result when rolling back a partial record.
+
+### Validation
+
+- Build: 54/54 (Debug and Release).
+- `ctest`: 7/7.
+- Cluster smoke and partition smoke: passed.
+- Baseline (2 vCPU AMD Ryzen 9 8945HX VM, ext4, RocksDB 8.9.1):
+  - single-node Put 1176 / 1532 / 1796 ops/s at 1 / 8 / 32 threads; `sync_calls : proposals` = 1:1, mean fsync 500 µs.
+  - cluster Put 513 ops/s at 1 thread; 8/32 threads collapse to 114/125 ops/s, traced to ~100× redundant AppendEntries from per-proposal broadcasts and a lossy bounded send queue.
+
 ## v0.3.0 — ReadIndex & Partition Safety
 
 ### Added
