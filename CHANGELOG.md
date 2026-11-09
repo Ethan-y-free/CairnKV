@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4.2 — Replication Pipelining
+
+### Added
+
+- Per-peer in-flight replication windows: `next_index` advances optimistically, `match_index` only on confirmed responses, up to 4 batches in flight.
+- `PeerClient` sender/receiver threads; `Send()` reports a full queue instead of silently dropping the oldest message.
+- 1s in-flight retry and explicit rollback when a follower rejects a batch.
+- `examples/basic.cc` (libcairnkv walkthrough) and `docs/case-study-w4.md`.
+
+### Changed
+
+- WAL `fdatasync` moved to a dedicated group-commit thread; `commit_index` is bounded by `last_synced_index`.
+- Heartbeats are sent only when the replication window has room.
+
+### Fixed
+
+- Data race on `EventLoop::thread_id_` (found by TSan under cluster-smoke).
+
+### Validation
+
+- Build: 54/54; `ctest`: 7/7.
+- TSan (`halt_on_error=1`): ctest + cluster-smoke + 5s benchmark, zero reports.
+- ASan+UBSan: ctest + 5s benchmark, zero reports.
+- Cluster Put 8t/32t: 114/125 -> 1894/1901 ops/s; p99 132/452 ms -> 6.5/20.9 ms.
+- Single-node Put 8t/32t: 1532/1796 -> 3574/3475 ops/s.
+
 ## v0.4.1 — Benchmark Baseline & Raft Metrics
 
 ### Added
