@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.0.0 — API Freeze
+
+Milestone release: `libcairnkv` public API, wire protocol, and operational
+behavior are frozen so CairnShop can pin this tag.
+
+### Changed
+
+- No wire-protocol or Raft behavior changes relative to v0.4.2. This release
+  is the v1.0 API/quality milestone, not a feature drop.
+- README rewritten around the v1.0 feature set, validation matrix, and the
+  corrected multi-node smoke order.
+- Added `docs/releases/v1.0.0.md` and `docs/case-study-w5.md` (fault model,
+  benchmark methodology, and rejected optimizations).
+
+### Validation
+
+- Build: 56/56 (Debug; v0.4.2 tree plus documentation-only changes).
+- `ctest`: 7/7.
+- cluster-smoke + partition-smoke: passed on a fresh cluster.
+- Performance: v0.4.2 measurements remain the reference (cluster Put
+  1894/1901 ops/s at 8/32 threads on the original 2 vCPU VM). Absolute
+  numbers drift with host/disk state; use same-session A/B for comparisons.
+
+### Evaluated and not shipped
+
+- Follower asynchronous group-commit acknowledgments (W5-1): correct and
+  fully tested, but same-machine A/B showed -10%/-15% cluster write
+  throughput on the current VM (fsync ~1120 µs, closed-loop load leaves the
+  replication window under-filled). Patch archived at
+  `cairnkv-w5-1-follower-async-ack.patch`; revisit on faster storage or with
+  open-loop load.
+- Snapshot / InstallSnapshot: still the designated stretch item; deferred to
+  post-v1.0. The design and on-disk formats remain compatible.
+
+### Known limits
+
+- Single Raft group; no sharding / multi-Raft.
+- No snapshot / InstallSnapshot; the WAL is not compacted.
+- Reads: ReadIndex (default) and stale; no lease read / follower read.
+- No dynamic membership, TLS, or multi-machine deployment tooling.
+
 ## v0.4.2 — Replication Pipelining
 
 ### Added

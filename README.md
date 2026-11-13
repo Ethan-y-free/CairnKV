@@ -6,7 +6,7 @@ Raft-backed、强一致的 KV 中间件。
 - epoll 多 reactor + 单 Raft core；WAL 持久化 + RocksDB 状态机
 - 可复用客户端 SDK：`libcairnkv`
 
-Current release: `v0.3.0`
+Current release: `v1.0.0`（API / wire protocol 冻结，CairnShop 固定依赖此 tag）
 
 ## Scope
 
@@ -43,6 +43,21 @@ Current release: `v0.3.0`
 - 读请求在 leader 未 ready 时排队，step down 时统一失败并携带 leader hint
 - 测试专用 partition 钩子：`cairnctl partition <ids>` / `unpartition`，同时丢弃出入向 Raft traffic
 - `scripts/partition-smoke.sh`：隔离 leader，验证 linearizable read 失败、stale read 成功、多数派选新 leader、恢复后收敛
+
+**W4 完整实现（性能与可观测）**：
+
+- WAL 组提交：`fdatasync` 移出 Raft core，由独立 WAL 线程按批合并
+- 复制流水线：每 peer 乐观推进 `next_index`、最多 4 个 in-flight 批次、1s 超时重传
+- `cairnkv-bench` + `scripts/bench.sh`：单节点/集群矩阵、p50–p999、原始 JSON 与节点日志归档
+- 每秒 Raft metrics：proposals、fsync 次数/延迟、apply、AppendEntries 收发/拒绝、每 peer `next/match/inflight`
+- `examples/basic.cc` 与 `docs/case-study-w4.md`
+
+**W5 / v1.0（冻结）**：
+
+- 不新增协议行为；冻结 `libcairnkv` API、wire protocol、on-disk 格式
+- 文档收尾：`docs/releases/v1.0.0.md`、`docs/case-study-w5.md`
+- Snapshot / InstallSnapshot 按设计保留为 stretch，v1.0 不包含；WAL 暂不做 compact
+- 已评估并回退：follower 异步组提交 ack（同机 A/B 在当前 VM 上 -10~15%，见 case study）
 
 ## 依赖
 
@@ -120,14 +135,16 @@ mkdir -p data/node-1
 脚本在本地启动多个进程，用于验证选主、复制、follower redirect 和故障切换。
 
 ```bash
+# 选主 / 复制 / leader failover（会 kill 掉当时的 leader）
 ./scripts/run-cluster.sh
 ./scripts/cluster-smoke.sh
+./scripts/stop-cluster.sh
 
-# 读一致性 / 分区：
+# 分区一致性：必须是全新集群（cluster-smoke 杀掉了一个节点）
+./scripts/run-cluster.sh
 ./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6667 get smoke:key
 ./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6667 --stale get smoke:key
 ./scripts/partition-smoke.sh
-
 ./scripts/stop-cluster.sh
 ```
 
