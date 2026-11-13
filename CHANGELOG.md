@@ -1,38 +1,21 @@
 # Changelog
 
-## v1.0.1 — README Rewrite
-
-Documentation-only patch; no Raft, wire-protocol, or on-disk format changes.
-
-### Changed
-
-- README rewritten as a v1.0 project overview: positioning, architecture and
-  threading model, consistency and failure semantics, validation matrix,
-  benchmark methodology, quick start, SDK example, project layout, and docs
-  index.
-- Future work (snapshot/InstallSnapshot, lease read, dynamic membership,
-  multi-Raft) is presented as a roadmap instead of release gaps.
-- Removed downstream-specific and unrelated contribution references from the
-  public README and release notes; the docs now describe CairnKV only.
-- Version string bumped to 1.0.1 to mark the docs release.
-
-### Validation
-
-- No behavior changes; `ctest` remains 7/7 on the v1.0.0 code tree.
-
 ## v1.0.0 — API Freeze
 
 Milestone release: `libcairnkv` public API, wire protocol, and operational
-behavior are frozen so CairnShop can pin this tag.
+behavior are frozen so downstream services can pin this tag.
 
 ### Changed
 
 - No wire-protocol or Raft behavior changes relative to v0.4.2. This release
   is the v1.0 API/quality milestone, not a feature drop.
-- README rewritten around the v1.0 feature set, validation matrix, and the
-  corrected multi-node smoke order.
+- README rewritten as a v1.0 project overview: positioning, architecture and
+  threading model, consistency and failure semantics, validation matrix,
+  benchmark methodology, quick start, SDK example, project layout, and docs
+  index. Future work is presented as a roadmap instead of release gaps.
 - Added `docs/releases/v1.0.0.md` and `docs/case-study-w5.md` (fault model,
   benchmark methodology, and rejected optimizations).
+- Public docs describe CairnKV only; downstream-specific references removed.
 
 ### Validation
 

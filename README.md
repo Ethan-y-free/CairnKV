@@ -3,7 +3,7 @@
 Raft-backed KV middleware in C++20: linearizable writes, ReadIndex reads,
 WAL durability, and a reusable client SDK (`libcairnkv`).
 
-**v1.0.1** — API / wire protocol / on-disk formats frozen.
+**v1.0.0** — API / wire protocol / on-disk formats frozen.
 
 ---
 
@@ -210,7 +210,7 @@ docs/                 design、case study、benchmark、release notes
 - [W4 case study](docs/case-study-w4.md)：从广播风暴到流水线复制的调优过程
 - [W5 case study](docs/case-study-w5.md)：v1.0 收尾、故障矩阵与性能方法论
 - [v0.4 基线](docs/benchmarks/v0.4-baseline.md)：压测方法与原始数据
-- [v1.0.1 release notes](docs/releases/v1.0.1.md) · [v1.0.0](docs/releases/v1.0.0.md)
+- [v1.0.0 release notes](docs/releases/v1.0.0.md)
 
 ## Roadmap
 
@@ -221,4 +221,4 @@ docs/                 design、case study、benchmark、release notes
 
 ## 状态
 
-- `v1.0.1` 已发布：API、wire protocol、on-disk 格式冻结。
+- `v1.0.0` 已发布：API、wire protocol、on-disk 格式冻结。
