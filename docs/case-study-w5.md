@@ -74,7 +74,7 @@ numbers are not a baseline when the host or disk state can change.
 
 ## 5. v1.0 API contract
 
-CairnShop can rely on:
+Downstream services can rely on:
 
 - `Client::Put/Get/Scan/Delete/GetStatus` signatures and semantics.
 - `ReadOptions{mode = kLinearizable | kStale}` and `applied_index`.

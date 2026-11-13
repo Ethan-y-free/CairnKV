@@ -1,138 +1,158 @@
 # CairnKV
 
-Raft-backed、强一致的 KV 中间件。
+Raft-backed KV middleware in C++20: linearizable writes, ReadIndex reads,
+WAL durability, and a reusable client SDK (`libcairnkv`).
 
-- 线性一致写；读支持 `kLinearizable`（ReadIndex）与 `kStale`
-- epoll 多 reactor + 单 Raft core；WAL 持久化 + RocksDB 状态机
-- 可复用客户端 SDK：`libcairnkv`
+**v1.0.1** — API / wire protocol / on-disk formats frozen.
 
-Current release: `v1.0.0`（API / wire protocol 冻结，CairnShop 固定依赖此 tag）
+---
 
-## Scope
+## 定位
 
-- 单 Raft group：不做 sharding / multi-Raft。横向写扩展需要 multi-Raft，本项目专注单 group 的共识正确性与可验证性。
-- Snapshot、lease read、动态成员变更属于 future work。
-- 验证环境为本地多进程集群 + 故障注入，不依赖多机部署。
+CairnKV 是一个可复用的**强一致 KV 中间件**，不是业务数据库：它只负责
+Raft 共识、日志持久化、状态机复制和客户端会话语义，业务表、缓存、审计
+留给上层。
 
-## 当前状态
+当前版本专注于**单 Raft group 的共识正确性与可验证性**：
 
-**W1 完整实现（单节点）**：
+- 3 节点集群；客户端可从任一节点接入（自动重定向 leader），写由 leader 串行化；
+- 线性一致 `Put/Delete`；`Get` 默认 ReadIndex 线性一致，`kStale` 可选；
+- 崩溃恢复、leader 故障切换、网络分区均可本地复现；
+- 单 group 之上不引入分片，multi-Raft 是后续演进方向，不混进 v1.0 的
+  正确性边界。
 
-- epoll 多 reactor 网络层（Acceptor + N IO loops + non-blocking + ET）
-- 二进制 RPC 帧（magic / version / request_id / length / CRC32）
-- WAL：append / fsync / 重启恢复 / torn tail 截断 / TruncateSuffix
-- RocksDB state machine：Put / Delete / Get / Scan / last_applied 原子写
-- 单节点 KVService：Put / Get / Delete / Scan / Status
-- 阻塞式 C++ client SDK + `cairnctl`
-- GTest：encoding / WAL / hard state / state machine / KVService
+## 架构
 
-**W2 完整实现（Raft core）**：
-
-- Raft election：随机 election timeout、RequestVote、term/vote 持久化后再回复
-- AppendEntries：`prevLogIndex/prevLogTerm` 校验、冲突 suffix 截断、fsync 后再 success
-- commit rule：只提交当前 term 且多数派 match 的条目；leader 上台追加 no-op
-- leader redirect：follower 返回 leader 地址，client 自动重连并重试
-- peer transport：每 peer 一个发送线程 + 阻塞 socket，Raft core 不做网络 I/O
-- Raft core：单线程任务队列，所有 Raft 状态只在一个线程里修改
-- GTest：RaftMessage 编解码、单节点选举/重启恢复/删除
-
-**W3 完整实现**：
-
-- `Get` 默认走 **ReadIndex**：leader 确认 current-term no-op 已提交 → 记录 readIndex → 向多数派发 heartbeat → 等 `lastApplied >= readIndex` 后再读
-- `kStale` 读：任意节点本地读，返回 `applied_index`，不保证最新
-- 读请求在 leader 未 ready 时排队，step down 时统一失败并携带 leader hint
-- 测试专用 partition 钩子：`cairnctl partition <ids>` / `unpartition`，同时丢弃出入向 Raft traffic
-- `scripts/partition-smoke.sh`：隔离 leader，验证 linearizable read 失败、stale read 成功、多数派选新 leader、恢复后收敛
-
-**W4 完整实现（性能与可观测）**：
-
-- WAL 组提交：`fdatasync` 移出 Raft core，由独立 WAL 线程按批合并
-- 复制流水线：每 peer 乐观推进 `next_index`、最多 4 个 in-flight 批次、1s 超时重传
-- `cairnkv-bench` + `scripts/bench.sh`：单节点/集群矩阵、p50–p999、原始 JSON 与节点日志归档
-- 每秒 Raft metrics：proposals、fsync 次数/延迟、apply、AppendEntries 收发/拒绝、每 peer `next/match/inflight`
-- `examples/basic.cc` 与 `docs/case-study-w4.md`
-
-**W5 / v1.0（冻结）**：
-
-- 不新增协议行为；冻结 `libcairnkv` API、wire protocol、on-disk 格式
-- 文档收尾：`docs/releases/v1.0.0.md`、`docs/case-study-w5.md`
-- Snapshot / InstallSnapshot 按设计保留为 stretch，v1.0 不包含；WAL 暂不做 compact
-- 已评估并回退：follower 异步组提交 ack（同机 A/B 在当前 VM 上 -10~15%，见 case study）
-
-## 依赖
-
-- Linux（epoll、signalfd、eventfd）
-- g++ 12+ 或 clang 15+
-- CMake 3.20+
-- RocksDB（`librocksdb-dev`）
-- GoogleTest（`libgtest-dev` 或已安装的 GTest CMake package）
-
-Ubuntu/Debian：
-
-```bash
-sudo apt install build-essential cmake librocksdb-dev libgtest-dev
+```
+        ┌──────────────┐        ┌──────────────┐
+        │  cairnctl    │        │ libcairnkv   │
+        └──────┬───────┘        └──────┬───────┘
+               │  TCP + binary frame   │
+               ▼                       ▼
+        ┌──────────────────────────────────────┐
+        │              cairnkd                 │
+        │  epoll I/O loops ──► RPC server      │
+        │        │                 │           │
+        │        ▼                 ▼           │
+        │   peer transport   single Raft core  │
+        │        │                 │           │
+        │        ▼                 ▼           │
+        │   WAL group commit   RocksDB state   │
+        └──────────────────────────────────────┘
+               │                     │
+               ▼                     ▼
+          other cairnkd          raft.log + state/
 ```
 
-## 构建
+- **网络层**：epoll 多 reactor、非阻塞 socket、二进制帧（magic / version /
+  request_id / length / CRC32）。
+- **Raft core**：单线程任务队列；所有 term / vote / log / commit 状态只在
+  这一个线程修改，避免共识层锁竞争。
+- **WAL**：独立组提交线程，`fdatasync` 按批合并；只有 durable 的条目才能
+  被 majority commit。
+- **状态机**：RocksDB；`last_applied` 与数据在同一个 WriteBatch 原子写入。
+- **复制**：每 peer 最多 4 个 in-flight 批次，`next_index` 乐观推进，
+  `match_index` 只接受已确认响应；1s 超时回退重传。
+- **客户端**：阻塞式 C++ SDK，自动处理 `kNotLeader` 重定向与重连。
 
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j
-```
+## 一致性模型
 
-## 测试
+**写路径**
+
+1. client 请求进入 leader；leader 追加日志并交给 WAL 线程；
+2. WAL `fdatasync` 完成前，该条目不会被算作 durable；
+3. leader 向 follower 流水线复制；follower 先 append、再 fsync、最后回 success；
+4. 当前 term 且 majority `match_index` 覆盖的条目才推进 `commit_index`；
+5. apply 到 RocksDB 后才向 client 返回。
+
+**读路径**
+
+- `ReadIndex`（默认）：leader 确认 current-term no-op 已提交 → 记录
+  `read_index` → 向多数派发 heartbeat → 等 `last_applied >= read_index`
+  再读。旧 leader 在分区期间不会返回线性一致结果。
+- `kStale`：任意节点本地读，返回 `applied_index`，不保证最新；用于后台
+  缓存、运营看板等可容忍陈旧的场景。
+
+**故障语义**
+
+| 场景 | 行为 |
+|---|---|
+| leader 挂掉 | 1–2s 内重新选主；已 commit 数据不丢 |
+| leader 被隔离 | 线性一致读超时/失败；stale 读仍可返回本地值 |
+| 少数派分区 | 无法 commit；多数派继续服务 |
+| 分区恢复 | 日志收敛，`commit_index` / `last_applied` 对齐 |
+| 进程重启 | WAL 重放；torn tail 自动截断 |
+| follower 落后 | leader 回退 `next_index`，批量重传 |
+
+## 验证
+
+- 单元测试：encoding、WAL（含 torn tail / 截断）、hard state、状态机、
+  RaftMessage 编解码、单节点选举/重启/删除。
+- 集成测试：`cluster-smoke`（leader kill + failover）、`partition-smoke`
+  （隔离 leader、多数派选主、恢复收敛）。
+- Sanitizer：TSan 全量 ctest + cluster-smoke + 压测零报告；ASan+UBSan 同样
+  零报告。
+- 性能工具：`cairnkv-bench` + `scripts/bench.sh`，输出 p50–p999、错误分类
+  与服务端快照；原始 JSON 与节点日志归档到 `docs/benchmarks/results/`。
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-预期：`encoding_test`、`wal_test`、`hard_state_test`、`state_machine_test`、`kv_service_test`、`raft_message_test`、`raft_node_test` 全部通过。
+## 性能
 
-## 示例
+环境：2 vCPU、ext4、RocksDB 8.9.1、Release、64B value、keyspace 1000。
+数据来自 v0.4.2（v1.0 无协议/行为变更）。
 
-`examples/basic.cc` 演示 `libcairnkv` 的基本用法：Put/Get（线性一致与 stale）、Scan、Delete、集群状态。
+| 场景 | 吞吐 | p99 |
+|---|---:|---:|
+| 单节点 Put 8t / 32t | 3574 / 3475 ops/s | — |
+| 3 节点 Put 8t / 32t | **1894 / 1901 ops/s** | **6.5 / 20.9 ms** |
+| 3 节点 linearizable Get 8t | 6760 ops/s | — |
+| 3 节点 stale Get 8t | 16055 ops/s | — |
+
+相比未优化版本（集群 Put 8t = 114 ops/s，p99 = 132 ms），主要收益来自：
+
+- 消除“每条 proposal 全量广播”的放大（约 100× → 每 peer 每批一次）；
+- WAL 组提交，把 fsync 从 core 线程移出；
+- 每 peer 流水线 + 有界 in-flight，队列不再静默丢弃。
+
+> 绝对数字与机器/磁盘状态强相关。仓库保留 `scripts/bench.sh`，用于同机
+> A/B，而不是拿不同环境的绝对数比较。方法与基线见
+> [v0.4 baseline](docs/benchmarks/v0.4-baseline.md)。
+
+## 快速开始
+
+依赖：
 
 ```bash
-cmake --build build --target cairnkv-example-basic
-./build/examples/cairnkv-example-basic --addr 127.0.0.1:6666
+sudo apt install build-essential cmake librocksdb-dev libgtest-dev
 ```
 
-## 压测
+构建与测试：
 
 ```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release -j
-
-BUILD_DIR=build-release ./scripts/bench.sh single    # 单节点基线
-BUILD_DIR=build-release ./scripts/bench.sh cluster   # 多节点基线
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-矩阵覆盖 Put（1/8/32 线程）、linearizable Get 与 stale Get；原始 JSON 输出到 `docs/benchmarks/results/<single|cluster>/`，方法与结果见 [v0.4 性能基线](docs/benchmarks/v0.4-baseline.md)。
-
-## 运行
+单节点：
 
 ```bash
 mkdir -p data/node-1
-./build/cairnkd --id node-1 --listen 127.0.0.1:6666 --data-dir data/node-1 --io-threads 4
+./build/cairnkd --id node-1 --listen 127.0.0.1:6666 \
+  --data-dir data/node-1 --io-threads 4
 ```
-
-另开终端：
 
 ```bash
-./build/cairnctl --addr 127.0.0.1:6666 put user:1 alice
-./build/cairnctl --addr 127.0.0.1:6666 get user:1
-./build/cairnctl --addr 127.0.0.1:6666 scan user:
-./build/cairnctl --addr 127.0.0.1:6666 status
-./build/cairnctl --addr 127.0.0.1:6666 delete user:1
+./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6666 put user:1 alice
+./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6666 get user:1
+./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6666 scan user:
+./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6666 status
 ```
 
-单进程模式也会走完整的 Raft 选举，`status` 会在约 150–300ms 后显示 `role=leader`。重启 `cairnkd` 后数据仍在；删除 `data/node-1/state` 后，RaftNode 会从 `raft.log` 重放。
-
-`cairnctl --stale get` 会走本地读；不加 `--stale` 时默认 ReadIndex 线性一致读。
-
-### 多节点集群
-
-脚本在本地启动多个进程，用于验证选主、复制、follower redirect 和故障切换。
+3 节点集群 + 故障注入：
 
 ```bash
 # 选主 / 复制 / leader failover（会 kill 掉当时的 leader）
@@ -140,50 +160,65 @@ mkdir -p data/node-1
 ./scripts/cluster-smoke.sh
 ./scripts/stop-cluster.sh
 
-# 分区一致性：必须是全新集群（cluster-smoke 杀掉了一个节点）
+# 分区一致性（必须新起集群）
 ./scripts/run-cluster.sh
-./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6667 get smoke:key
-./build/tools/cairnctl/cairnctl --addr 127.0.0.1:6667 --stale get smoke:key
 ./scripts/partition-smoke.sh
 ./scripts/stop-cluster.sh
 ```
 
-脚本默认使用 `build/cairnkd` 和 `build/tools/cairnctl/cairnctl`；如果 VS 的构建目录不同：
+SDK：
 
-```bash
-BIN=/path/to/cairnkd CTL=/path/to/cairnctl ./scripts/cluster-smoke.sh
+```cpp
+#include "cairnkv/client.h"
+
+cairnkv::ClientOptions options;
+options.host = "127.0.0.1";
+options.port = 6666;
+
+auto client = cairnkv::Client::Open(options);
+if (!client.ok())
+{
+    return 1;
+}
+
+(*client)->Put("user:1", "alice");
+auto value = (*client)->Get("user:1", cairnkv::ReadOptions{});
 ```
 
-客户端连到 follower 会自动重定向到 leader；`cairnctl status` 直连某个节点时显示该节点自身的角色，方便观察 follower。
+完整示例见 [`examples/basic.cc`](examples/basic.cc)。
 
-## 数据布局
+## 工程结构
 
 ```
-data/node-1/raft.log   # WAL: [payload_len][crc32][payload]
-data/node-1/state/     # RocksDB state machine
+include/cairnkv/      public SDK（client / status / version）
+src/net/              epoll、Channel、EventLoop、Connection
+src/rpc/              帧格式与消息编解码
+src/raft/             Raft core、WAL、hard state、peer transport
+src/storage/          RocksDB state machine
+src/consensus/        RPC server、request pool
+src/server/           cairnkd 入口
+src/client/           SDK 实现
+tools/                cairnctl、cairnkv-bench
+tests/                GTest
+scripts/              cluster / smoke / partition / bench
+docs/                 design、case study、benchmark、release notes
 ```
 
 ## 文档
 
-- [总体设计 v2](DESIGN-draft-v2.md)
-- [中间件边界](MIDDLEWARE-BOUNDARY.md)
-- [CHANGELOG](CHANGELOG.md)
-- [Release notes](docs/releases/)
+- [设计稿 v2](DESIGN-draft-v2.md)：网络、WAL、Raft、ReadIndex、worker 线程模型
+- [W4 case study](docs/case-study-w4.md)：从广播风暴到流水线复制的调优过程
+- [W5 case study](docs/case-study-w5.md)：v1.0 收尾、故障矩阵与性能方法论
+- [v0.4 基线](docs/benchmarks/v0.4-baseline.md)：压测方法与原始数据
+- [v1.0.1 release notes](docs/releases/v1.0.1.md) · [v1.0.0](docs/releases/v1.0.0.md)
 
-## 目录
+## Roadmap
 
-```
-include/cairnkv/   公共 API：status / types / client
-src/common/        Status / encoding / logging
-src/net/           epoll event loop / acceptor / connection / tcp server
-src/rpc/           frame / message
-src/raft/          log entry / WAL / hard state / RaftMessage / RaftNode / PeerClient
-src/storage/       RocksDB state machine
-src/consensus/     RPC server adapter（client dispatch + Raft message dispatch）
-src/server/        kv_service（W1 单节点参考实现）/ cairnkd main
-src/client/        libcairnkv
-tools/cairnctl/    CLI
-tools/cairnkv-bench/  closed-loop 压测工具
-scripts/           run-cluster / stop-cluster / cluster-smoke / partition-smoke / bench
-tests/             unit tests
-```
+- **Snapshot / InstallSnapshot**：日志压缩与落后节点追赶（下一里程碑）。
+- **Lease read / follower read**：降低跨地域读延迟。
+- **动态成员变更**：扩缩容不重启集群。
+- **Multi-Raft / sharding**：在单 group 正确性稳定后做横向扩展。
+
+## 状态
+
+- `v1.0.1` 已发布：API、wire protocol、on-disk 格式冻结。
